@@ -1,0 +1,324 @@
+# The header row of each sheet in the LIVE workbook, in order, one per line.
+#
+# This is the ground truth the column constants are checked against.  Supplied by
+# the desk on 2026-08-31 and reconciled against the workbook itself; before it
+# existed, check_layout.py could only prove the constants were consistent with
+# EACH OTHER, which they were - while being one column out from the sheet they
+# addressed, on three sheets at once, for who knows how long.
+#
+# Format:  <sheet>\t<1-based position>\t<header text>
+# Blank header text means the column is deliberately unnamed.
+#
+# Bonds 10 is headed "Product" and HOLDS the portfolio - confirmed with the
+# desk.  BCOL_PORTFOLIO points at it deliberately; there is no column headed
+# "Portfolio" anywhere on Bonds.  The row below records what the sheet says,
+# because that is this file's job; the alias in tools/check_layout.py is what
+# bridges the two.
+#
+# To update: change the workbook, change this file, run tools/check_layout.py.
+Bonds	1	ISIN
+Bonds	2	Name
+Bonds	3	Currency
+Bonds	4	Coupon_Dec
+Bonds	5	CouponFreq
+Bonds	6	MaturityDate
+Bonds	7	Notional
+Bonds	8	AvgCost
+Bonds	9	AcctgCat
+Bonds	10	Product
+Bonds	11	BookVal_EUR
+Bonds	12	DaysLeft
+Bonds	13	OIS_T0
+Bonds	14	OIS_T-1
+Bonds	15	DF_T0
+Bonds	16	DF_T-1
+Bonds	17	FX_T0
+Bonds	18	FX_T-1
+Bonds	19	CleanPx_T0
+Bonds	20	DirtyPx_T0
+Bonds	21	AccruedInterest_T0
+Bonds	22	YTM_T0
+Bonds	23	ModDur_T0
+Bonds	24	Convexity
+Bonds	25	ZSprd_T0
+Bonds	26	ASW_T0
+Bonds	27	CleanPx_T-1
+Bonds	28	DirtyPx_T-1
+Bonds	29	YTM_T-1
+Bonds	30	ZSprd_T-1
+Bonds	31	ASW_T-1
+Bonds	32	DV01_EUR
+Bonds	33	DirtyMV_T0_EUR
+Bonds	34	DirtyMV_T-1_EUR
+Bonds	35	BookVal_EUR2
+Bonds	36	ISpread_T0
+Bonds	37	ISpread_T-1
+Bonds	38	GSpread_T0
+Bonds	39	GSpread_T-1
+Bonds	40	ISpread_Status
+Bonds	41	BBG_Ticker
+Bonds	42	Ticker_Status
+Bonds	43	OAS_T0
+Bonds	44	OAS_T-1
+Bonds	45	DeltaOAS
+Bonds	46	DV01_Unit
+Bonds	47	SpreadDuration_Used
+Bonds	48	OAS_ModDuration_Raw
+Bonds	49	OAS_Convexity
+Bonds	50	Pricing_Source
+Bonds	51	Last_Pricing_Date
+Bonds	52	Benchmark_Bond
+Bonds	53	Benchmark_Name
+Bonds	54	Gov_T0
+Bonds	55	Gov_T-1
+Bonds	56	Swap_T0
+Bonds	57	Swap_T-1
+Bonds	58	g_T0
+Bonds	59	g_T-1
+Bonds	60	Delta_g_bp
+Bonds	61	q_T0
+Bonds	62	q_T-1
+Bonds	63	Delta_q_bp
+Bonds	64	Delta_i_bp
+Bonds	65	Delta_y_bp
+Bonds	66	FundTkr
+Bonds	67	FundRate_T0
+Bonds	68	Bond_Status
+Bonds	69	SwapLink
+Bonds	70	FutLink
+Bonds	71	BBG_Cand_ISIN
+Bonds	72	BBG_Cand_slashISIN
+Bonds	73	BBG_Cand_Corp
+Bonds	74	BBG_Cand_BVAL_Corp
+Bonds	75	BBG_Cand_BGN_Corp
+Bonds	76	BBG_Cand_Govt
+Bonds	77	BBG_Cand_BVAL_Govt
+Bonds	78	BBG_Cand_BGN_Govt
+Bonds	79	BBG_Cand_Mtge
+Bonds	80	BBG_Cand_MMkt
+Bonds	81	Convexity_Bump_bp
+Bonds	82	CouponFreq_Num
+Bonds	83	Price_Base
+Bonds	84	Price_Up
+Bonds	85	Price_Down
+Bonds	86	Convexity_Bump
+Bonds	87	DAY_CNT_DES
+Bonds	88	BondDCC_Code
+Bonds	89	BondDCC_Name
+Bonds	90	DV01_Opening_EUR
+Futures	1	ContractCode
+Futures	2	Exchange
+Futures	3	CCY
+Futures	4	Contracts
+Futures	5	FaceValue
+Futures	6	DelivDate
+Futures	7	CTD_ISIN
+Futures	8	CTD_CF
+Futures	9	Portfolio
+Futures	10	LinkedISIN
+Futures	11	AvgEntryPx
+Futures	12	DaysToDeliv
+Futures	13	FX_T0
+Futures	14	FutPx_T0
+Futures	15	CTD_DirtyPx_T0
+Futures	16	CTD_Ticker_T-1
+Futures	17	FutPx_T-1
+Futures	18	ImpliedRepo_Calc
+Futures	19	GrossBasis_Calc
+Futures	20	NotionalValue_EUR
+Futures	21	FuturesPnL_EUR
+Futures	22	BBG_Ticker
+Futures	23	Status_T0
+Futures	24	Status_T-1
+Futures	25	FUT_VAL_PT
+Futures	26	CTD_Ticker
+Futures	27	HedgeUnitDV01
+Futures	28	Futures_DV01_EUR
+Futures	29	ImpliedRepo_BBG
+Futures	30	NetBasis_BBG
+Futures	31	GrossBasis_BBG
+Futures	32	Status
+Futures	33	Coverage_SourceRow
+Futures	34	CoverageRelation
+Futures	35	FutureLabel
+Futures	36	HedgeType
+Futures	37	Coverage_StartDate
+Futures	38	CoverageInfo_D
+Futures	39	Hedge_Source
+Futures	40	Coverage_BPV
+Futures	41	Hedge_Class
+Futures	42	Link_Source
+Swaps	1	DealID
+Swaps	2	Ccy
+Swaps	3	Notional
+Swaps	4	FixedRate
+Swaps	5	FloatIndex
+Swaps	6	FloatSpread
+Swaps	7	StartDate
+Swaps	8	EndDate
+Swaps	9	PayFixed
+Swaps	10	Portfolio
+Swaps	11	FloatCurve_Type
+Swaps	12	LinkedISIN
+Swaps	13	Cpty
+Swaps	14	YearFrac
+Swaps	15	DV01 BBG
+Swaps	16	BQL_NPV_Direct_T0
+Swaps	17	BQL_NPV_Fixed_T0
+Swaps	18	BQL_NPV_Float_T0
+Swaps	19	BQL_NPV_Total_T0
+Swaps	20	BQL_NPV_Direct_T-1
+Swaps	21	BQL_NPV_Fixed_T-1
+Swaps	22	BQL_NPV_Float_T-1
+Swaps	23	BQL_NPV_Total_T-1
+Swaps	24	BQL_Swap_PnL
+Swaps	25	OIS_T0
+Swaps	26	OIS_T-1
+Swaps	27	DF_T0
+Swaps	28	DF_T-1
+Swaps	29	Annuity_T0
+Swaps	30	Annuity_T-1
+Swaps	31	FX
+Swaps	32	PV_T0 da anuidade
+Swaps	33	PV_T-1 da anuidade
+Swaps	34	Swap_DV01 Calculated In house
+Swaps	35	Model_PnL
+Swaps	36	Status
+Swaps	37	PnL_Source
+Swaps	38	PnL
+Swaps	39	AF_Status
+Swaps	40	BBG_Swap_Direct_ID
+Swaps	41	BBG_Fixed_Leg_ID
+Swaps	42	BBG_Float_Leg_ID
+Swaps	43	Swap_ID_Source
+Swaps	44	CoverageRelation
+Swaps	45	SwapMap_SourceRow
+Swaps	46	SwapMap_Class
+Swaps	47	SwapMap_Status
+Swaps	48	Map_Notional
+Swaps	49	Map_CCY
+Swaps	50	Map_Counterparty
+Swaps	51	Notional_Final
+Swaps	52	Notional_Source
+Swaps	53	BQL_NPV_Direct_T0_DUP
+Swaps	54	BQL_NPV_Fixed_T0_DUP
+Swaps	55	BQL_NPV_Float_T0_DUP
+Swaps	56	BQL_NPV_Total_T0_DUP
+Swaps	57	BQL_NPV_Direct_T-1_DUP
+Swaps	58	BQL_NPV_Fixed_T-1_DUP
+Swaps	59	BQL_NPV_Float_T-1_DUP
+Swaps	60	BQL_NPV_Total_T-1_DUP
+Swaps	61	BQL_Swap_PnL_DUP
+Swaps	62	BQL_Swap_Status
+Swaps	63	PAY_FLT_RATE_IDX
+Swaps	64	FloatIndex_Family
+Swaps	65	FloatIndex_Tenor
+Swaps	66	FloatCurve_T0
+Swaps	67	FloatCurve_T-1
+Swaps	68	ModelSpread_T0
+Swaps	69	ModelSpread_T-1
+Swaps	70	Delta_FloatCurve_bp
+Swaps	71	Delta_ModelSpread_bp
+Swaps	72	Reserved_1
+Swaps	73	Reserved_2
+Swaps	74	Reserved_3
+Swaps	75	Reserved_4
+Swaps	76	Swap_DV01_EUR_Theoretical
+Swaps	77	FloatFamily_Status
+Swaps	78	Link_Source
+#
+# PNL_Attribution 81-84 are APPENDED BY THE MACRO, past the 80 columns the desk
+# sheet carries today.  They are not decoration: the Dashboard aggregates all
+# four (Dashboard.txt:1602, :1612, :2884, :3042 and the quarantine block at
+# :2817), so deleting them to reach exactly 80 columns would have silently
+# removed four working Dashboard blocks.  Setup_Workbook_Layout writes them.
+#
+# Two columns the code used to have are GONE rather than appended:
+#   Synthetic_Alternative_DV01  a verbatim copy of SyntheticSwap_DV01, read by
+#                               nothing
+#   Bond_DV01_Opening           a verbatim copy of Bonds!DV01_Opening_EUR; every
+#                               attribution leg now references the original
+PNL_Attribution	1	ISIN
+PNL_Attribution	2	Name
+PNL_Attribution	3	CCY
+PNL_Attribution	4	Portfolio
+PNL_Attribution	5	AcctgCat
+PNL_Attribution	6	Notional
+PNL_Attribution	7	ModDur
+PNL_Attribution	8	Convexity
+PNL_Attribution	9	SpreadDuration
+PNL_Attribution	10	Days
+PNL_Attribution	11	YearFrac
+PNL_Attribution	12	Bond BPVs
+PNL_Attribution	13	Bond DV01 Credit spread
+PNL_Attribution	14	Hedge (BPVs)
+PNL_Attribution	15	PlainSwap (BPVs)
+PNL_Attribution	16	Futures RTJ (BPVs)
+PNL_Attribution	17	Futures RT (BPVs)
+PNL_Attribution	18	Hedge_DV01_Gap
+PNL_Attribution	19	SyntheticSwap_DV01
+PNL_Attribution	20	Target_Hedge_DV01
+PNL_Attribution	21	Variação Bond (EUR)
+PNL_Attribution	22	Variação yield bond (bps)
+PNL_Attribution	23	Variação yield rf (bps)
+PNL_Attribution	24	Variação yield Gov (bps)
+PNL_Attribution	25	Variação Govi basis bp
+PNL_Attribution	26	Variação Swap bp
+PNL_Attribution	27	Variação Gov/Swap basis bp
+PNL_Attribution	28	Variação I spread bp
+PNL_Attribution	29	Variação Z spread bp
+PNL_Attribution	30	Variação G spread bp
+PNL_Attribution	31	Variação ASW bp
+PNL_Attribution	32	Variação OAS bp
+PNL_Attribution	33	PnL_Duration_Total
+PNL_Attribution	34	PnL_OIS
+PNL_Attribution	35	PnL_GovBasis
+PNL_Attribution	36	PnL_SwapGovBasis
+PNL_Attribution	37	PnL_Credit_Ispread
+PNL_Attribution	38	PnL_Convexity
+PNL_Attribution	39	Carry_Coupon
+PNL_Attribution	40	Carry_Pull_ToPar
+PNL_Attribution	41	Funding_Carry_Memo
+PNL_Attribution	42	Carry_Total
+PNL_Attribution	43	PnL_ZSpread
+PNL_Attribution	44	PnL_GSpread
+PNL_Attribution	45	PnL_ASW
+PNL_Attribution	46	PnL_OAS
+PNL_Attribution	47	SpreadPnL_Used
+PNL_Attribution	48	PnL_FX
+PNL_Attribution	49	Futures_Gov_Model_PnL
+PNL_Attribution	50	Swap_Curve_Model_PnL
+PNL_Attribution	51	Hedge_Curve_Model_PnL
+PNL_Attribution	52	Hedge_Model_Residual_PnL
+PNL_Attribution	53	Total_Model_Explained
+PNL_Attribution	54	Official_Total_PnL
+PNL_Attribution	55	Unexplained_Residual_PnL
+PNL_Attribution	56	Unexplained_Residual_Pct
+PNL_Attribution	57	Residual_DV01
+PNL_Attribution	58	Hedge_Ratio
+PNL_Attribution	59	Hedge_Efficiency
+PNL_Attribution	60	Attribution_Status
+PNL_Attribution	61	Futures_Match_Count
+PNL_Attribution	62	Actual_Futures_PnL
+PNL_Attribution	63	Swap_All_Match_Count
+PNL_Attribution	64	PlainSwap_Match_Count
+PNL_Attribution	65	Actual_PlainSwap_PnL
+PNL_Attribution	66	SyntheticSwap_Match_Count
+PNL_Attribution	67	Actual_SyntheticSwap_PnL
+PNL_Attribution	68	AllSwapRows_PnL_Diagnostic
+PNL_Attribution	69	Actual_Futures_PnL_Check
+PNL_Attribution	70	Futures_Gov_Model_PnL_Check
+PNL_Attribution	71	Futures_Model_Residual_PnL
+PNL_Attribution	72	Actual_PlainSwap_PnL_Check
+PNL_Attribution	73	Swap_Curve_Model_PnL_Check
+PNL_Attribution	74	Swap_Model_Residual_PnL
+PNL_Attribution	75	Actual_Hedge_PnL
+PNL_Attribution	76	Hedge_Model_Residual_PnL_Check
+PNL_Attribution	77	Spread_Framework_Auto
+PNL_Attribution	78	Spread_Framework_Reason
+PNL_Attribution	79	Duration_Identity_Check
+PNL_Attribution	80	Row_Valid
+PNL_Attribution	81	Row_Exclusion_Reason
+PNL_Attribution	82	FX_Exposure_EUR
+PNL_Attribution	83	Risk_Timing_Bias
+PNL_Attribution	84	Coupon_Paid_EUR

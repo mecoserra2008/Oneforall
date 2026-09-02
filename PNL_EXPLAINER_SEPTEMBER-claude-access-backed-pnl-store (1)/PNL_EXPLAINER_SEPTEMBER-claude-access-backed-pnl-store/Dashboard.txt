@@ -1,0 +1,3300 @@
+Option Explicit
+
+
+' =============================================================================
+' BUTTON 6 - PNL DASHBOARD  (formula-driven)
+'
+' Source:
+'   PNL_Attribution   header row 4, data from row 5
+'
+' DESIGN RULE
+'   VBA decides LAYOUT.  Excel computes every NUMBER.
+'
+'   This module writes formulas, never computed values.  Nothing on the
+'   Dashboard is a VBA arithmetic result, so:
+'     - the sheet recalculates when PNL_Attribution changes, instead of being a
+'       snapshot that goes silently stale until someone presses the button;
+'     - Ctrl+[ from any figure jumps to the rows behind it, so every number is
+'       auditable back to source;
+'     - a change to a PNL formula cannot leave the Dashboard disagreeing with it.
+'
+'   The only values written are text labels, and the source-row indices behind
+'   the ranked tables - both layout decisions, not measurements.
+'
+' COLUMN CONTRACT
+'   PNL_Attribution columns are resolved by HEADER TEXT, never by letter, and
+'   each is published as a workbook name "Pnl_<Header>" pointing at that
+'   column's data range.  Formulas read e.g.
+'       =SUMIFS(Pnl_Official_Total_PnL,Pnl_ISIN,"<>",Pnl_ISIN,"<>TOTAL")
+'   so they survive a column being inserted or moved upstream, and they say what
+'   they mean when a human opens the cell.
+'
+' THE BRIDGE
+'   Only PnL_Duration_Total enters the bridge sum; the OIS / Gov-OIS / Swap-Gov /
+'   Credit lines below it are "of which" MEMO lines and are deliberately NOT
+'   added in.  Summing those legs directly was double counting: which legs make
+'   up the duration total depends on each row's spread framework, so a
+'   G-framework row contributed a Swap-Gov leg it does not actually contain.
+'   A tie-out row proves the bridge closes rather than asking you to trust it.
+'
+' HEDGE EFFICIENCY
+'   Read from PNL_Attribution!Hedge_Efficiency.  It is NOT recomputed here.
+'   This module used to apply its own definition (a different target, and no
+'   clamping) so the same bond scored differently depending on which sheet you
+'   looked at.  One definition, one place.
+'
+' Compatibility:
+'   - Uses .Formula (not Formula2); no formula written here is a dynamic-array
+'     or legacy-CSE formula, so implicit intersection cannot bite.
+'   - Chart errors do not stop the Dashboard.
+'   - Reports the exact build stage if an error occurs.
+' =============================================================================
+
+
+Private Const DASH_SH_DASH As String = "Dashboard"
+Private Const DASH_SH_PNL As String = "PNL_Attribution"
+Private Const DASH_SH_CONFIG As String = "Config"
+Private Const DASH_SH_FUTURES As String = "Futures"
+Private Const DASH_SH_SWAPS As String = "Swaps"
+
+
+' Hedge-sheet geometry, needed for the reconciliation tiles that measure what
+' PNL_Attribution CANNOT see.  Mirrors FCOL_*/WCOL_* in the PNL module: keep in
+' step if the hedge sheets are re-laid out.
+'
+' COLUMNS are fixed; ROW EXTENTS are not.  These used to be frozen at
+' $U$5:$U$224 / $AB$5:$AB$204, which quietly assumed at most 220 futures and 200
+' swaps.  Past those counts the "unlinked hedge PnL" tiles - the ones whose whole
+' job is to reveal PnL the attribution cannot see - stopped counting the very
+' rows most likely to be unlinked.  The extent is now read from the sheet by
+' DashHedgeRange.
+Private Const DASH_FUT_PNL_COL As String = "U"       ' Futures!U   FuturesPnL_EUR
+Private Const DASH_FUT_LINK_COL As String = "J"      ' Futures!J   LinkedISIN
+Private Const DASH_FUT_KEY_COL As String = "A"       ' Futures!A   ContractCode
+Private Const DASH_SWAP_PNL_COL As String = "AB"     ' Swaps!AB    PnL
+Private Const DASH_SWAP_LINK_COL As String = "L"     ' Swaps!L     LinkedISIN
+Private Const DASH_SWAP_KEY_COL As String = "A"      ' Swaps!A     DealID
+
+
+' Swaps!BN DV01_BBG is the risk PNL_Attribution actually sums into
+' PlainSwap_DV01.  Swaps!X Swap_DV01_EUR is the INTERNAL model DV01, which the
+' attribution deliberately does not use - and which was a hundred times too
+' small until the annuity unit bug in modPNL was fixed.
+'
+' The framework validation table below used to read column X.  Its swap BPVs
+' were therefore both the wrong quantity and the wrong magnitude, so every bond
+' showed as ~99% unhedged and the "Framework Check" disagreed with the
+' framework the attribution had correctly chosen from column BN.  One column,
+' named once, so the two sheets cannot drift apart again.
+Private Const DASH_SWAP_DV01_COL As String = "BN"    ' Swaps!BN    DV01_BBG
+Private Const DASH_SWAP_SOURCE_COL As String = "AG"  ' Swaps!AG    Swap_ID_Source
+Private Const DASH_SWAP_FAMILY_COL As String = "BB"  ' Swaps!BB    FloatIndex_Family
+
+Private Const DASH_FUT_CLASS_COL As String = "AP"    ' Futures!AP  Hedge_Class
+Private Const DASH_FUT_NOTIONAL_COL As String = "T"   ' Futures!T   NotionalValue_EUR
+Private Const DASH_HEDGE_CLASS_FX As String = "FX"
+Private Const DASH_HEDGE_CLASS_RATES As String = "RATES"
+
+
+Private Const DASH_CFG_T_MINUS_1_DATE As String = "B4"
+Private Const DASH_CFG_T0_DATE As String = "B5"
+' Config!B24, stamped by RefreshMarketDataCore at the end of Buttons 1 and 2.
+Private Const DASH_CFG_LAST_REFRESH As String = "B24"
+
+
+Private Const DASH_HEADER_ROW As Long = 4
+Private Const DASH_DATA_ROW As Long = 5
+
+
+' Name prefix for the published PNL_Attribution column ranges.
+Private Const DASH_NAME_PREFIX As String = "Pnl_"
+
+
+' Hidden staging block: one column per ranked table, one row per source row,
+' holding a tie-broken sort key.  Lets the Top-N tables rank with plain LARGE /
+' MATCH over a range instead of an array formula, so no CSE and no VBA sorting.
+Private Const DASH_STAGE_FIRST_COL As Long = 60      ' BH
+Private Const DASH_STAGE_COLS As Long = 4
+Private Const DASH_TOP_N As Long = 10
+
+' Most rows the quarantine block will list before it stops and says how many
+' more there are.  The block's totals are unaffected - they are taken from
+' PNL_Attribution, not from the listing.
+Private Const DASH_QUARANTINE_MAX As Long = 40
+
+
+' Sentinel parked far below any real PnL so blank rows never win a LARGE().
+Private Const DASH_RANK_FLOOR As String = "-9.99999999999999E+300"
+
+' Every button this module installs is named with this prefix, and DashClear
+' keeps anything that carries it.  One place decides what survives a rebuild.
+Private Const DASH_BUTTON_PREFIX As String = "btnPnl"
+Private Const DASH_BUTTON_WIDTH As Double = 180
+Private Const DASH_BUTTON_HEIGHT As Double = 34
+
+
+' Layout cursor, so blocks that grow (status / framework counts) cannot collide
+' with whatever the previous build happened to place beneath them.
+Private dashRowCursor As Long
+Private dashLastRowCache As Long
+
+
+' =============================================================================
+' BUTTON INSTALLATION
+'
+' Puts the three buttons on the Dashboard in run order, left to right.  Run once
+' after importing the modules, or whenever the shapes have been lost.
+'
+' Idempotent: it deletes any button it previously installed before adding it
+' back, so pressing it twice does not leave two of everything.
+' =============================================================================
+
+
+Public Sub InstallButtons()
+
+
+    Dim ws As Worksheet
+
+
+    On Error GoTo InstallFail
+
+
+    Set ws = DashGetOrCreateSheet(DASH_SH_DASH)
+
+
+    DashAddButton ws, DASH_BUTTON_PREFIX & "LoadBonds", "Button1_LoadBonds", _
+        "1. Load bonds", 1
+    DashAddButton ws, DASH_BUTTON_PREFIX & "LoadHedges", "Button2_LoadHedgesAndAttribute", _
+        "2. Load hedges + attribute", 2
+    DashAddButton ws, DASH_BUTTON_PREFIX & "BuildDashboard", "Button3_BuildDashboard", _
+        "3. Build dashboard", 3
+
+
+    ' The old single button.  Removed rather than left behind: it ran
+    ' BuildDashboard_Step6 directly, skipping the full rebuild that Button 3
+    ' does first, so it produced a Dashboard that was internally consistent and
+    ' quietly built on the previous run's curve numbers.
+    On Error Resume Next
+    ws.Shapes("btnBuildDashboard6").Delete
+    On Error GoTo InstallFail
+
+
+    MsgBox "Three buttons installed on the Dashboard.", vbInformation
+    Exit Sub
+
+
+InstallFail:
+
+
+    MsgBox _
+        "Could not install the buttons." & vbCrLf & _
+        "Error " & CStr(Err.Number) & ": " & Err.Description, _
+        vbCritical
+
+
+End Sub
+
+
+Private Sub DashAddButton( _
+    ByVal ws As Worksheet, _
+    ByVal shapeName As String, _
+    ByVal macroName As String, _
+    ByVal caption As String, _
+    ByVal slot As Long)
+
+
+    Dim shp As Shape
+    Dim anchor As Range
+
+
+    On Error Resume Next
+    ws.Shapes(shapeName).Delete
+    On Error GoTo 0
+
+
+    Set anchor = ws.Range("H2")
+
+
+    Set shp = ws.Shapes.AddFormControl( _
+        xlButtonControl, _
+        anchor.Left + (slot - 1) * (DASH_BUTTON_WIDTH + 8), _
+        anchor.top, _
+        DASH_BUTTON_WIDTH, _
+        DASH_BUTTON_HEIGHT)
+
+
+    With shp
+        .Name = shapeName
+        .OnAction = macroName
+        .TextFrame.Characters.Text = caption
+    End With
+
+
+End Sub
+
+
+' =============================================================================
+' MAIN BUILD
+' =============================================================================
+
+
+Public Sub BuildDashboard_Step6()
+
+
+    Dim wsD As Worksheet
+    Dim wsP As Worksheet
+    Dim wsCfg As Worksheet
+
+
+    Dim lastRow As Long
+
+
+    Dim oldCalc As XlCalculation
+    Dim oldScreen As Boolean
+    Dim oldEvents As Boolean
+    Dim oldStatusBar As Variant
+
+
+    Dim buildStage As String
+    Dim buildCompleted As Boolean
+    Dim eNumber As Long
+    Dim eDescription As String
+
+
+    Dim topPairRow As Long
+    Dim countsTopRow As Long
+
+
+    On Error GoTo CleanFail
+
+
+    buildStage = "Finding Dashboard sheet"
+    Set wsD = DashGetOrCreateSheet(DASH_SH_DASH)
+
+
+    buildStage = "Finding PNL_Attribution sheet"
+    Set wsP = DashGetRequiredSheet(DASH_SH_PNL)
+
+
+    buildStage = "Finding Config sheet"
+    Set wsCfg = DashGetRequiredSheet(DASH_SH_CONFIG)
+
+
+    buildStage = "Saving Excel settings"
+
+
+    oldCalc = Application.Calculation
+    oldScreen = Application.ScreenUpdating
+    oldEvents = Application.EnableEvents
+    oldStatusBar = Application.StatusBar
+
+
+    Application.ScreenUpdating = False
+    Application.EnableEvents = False
+
+
+    buildStage = "Calculating PNL source"
+
+
+    Application.StatusBar = "Dashboard: calculating PNL_Attribution..."
+
+
+    Application.Calculate
+    DoEvents
+
+
+    Application.Calculation = xlCalculationManual
+
+
+    buildStage = "Finding final PNL row"
+
+
+    lastRow = DashLastPnlRow(wsP)
+    dashLastRowCache = lastRow
+
+
+    If lastRow < DASH_DATA_ROW Then
+
+
+        MsgBox _
+            "PNL_Attribution has no data rows." & vbCrLf & vbCrLf & _
+            "Run Button 1 (load bonds), then Button 2 (load hedges and " & _
+            "attribute) - Button 2 is what fills this sheet.", _
+            vbExclamation
+
+
+        GoTo CleanExit
+
+
+    End If
+
+
+    buildStage = "Validating PNL headers"
+
+
+    Application.StatusBar = "Dashboard: validating PNL headers..."
+
+
+    DashValidateSourceHeaders wsP
+
+
+    buildStage = "Publishing PNL column names"
+
+
+    ' Must run before any formula is written - every formula below refers to
+    ' these names rather than to column letters.
+    DashDefinePnlNames wsP, lastRow
+
+
+    buildStage = "Clearing Dashboard"
+
+
+    Application.StatusBar = "Dashboard: clearing Dashboard..."
+
+
+    DashClear wsD
+
+
+    ' The cursor is module-level, so reset it rather than inheriting wherever the
+    ' previous build happened to finish.
+    dashRowCursor = 0
+
+
+    buildStage = "Building hidden ranking stage"
+    DashBuildRankStage wsD, lastRow
+
+
+    buildStage = "Building Dashboard header"
+    DashBuildHeader wsD
+
+
+    buildStage = "Building KPI cards"
+    DashBuildKpis wsD
+
+
+    buildStage = "Building PNL factor bridge"
+    DashBuildFactorBridge wsD
+
+
+    buildStage = "Building carry summary"
+    DashBuildCarrySummary wsD
+
+
+    buildStage = "Building hedge summary"
+    DashBuildHedgeSummary wsD
+
+
+    ' These three blocks sit SIDE BY SIDE (columns A, D and G), so they share a
+    ' top row and each advances the cursor only if it is the tallest.
+    countsTopRow = dashRowCursor + 2
+
+
+    buildStage = "Building hedge-efficiency distribution"
+    DashBuildEfficiencyBuckets wsD, countsTopRow
+
+
+    buildStage = "Building attribution-status summary"
+    DashBuildStatusSummary wsD, wsP, lastRow, countsTopRow
+
+
+    buildStage = "Building spread-framework summary"
+    DashBuildFrameworkSummary wsD, wsP, lastRow, countsTopRow
+
+
+    ' The three count blocks above sit side by side and each grows with the
+    ' number of distinct values, so the tables below start beneath the tallest.
+    topPairRow = dashRowCursor + 2
+
+
+    buildStage = "Building top residuals"
+    DashBuildTopTable wsD, topPairRow, 1, 1, _
+        "Top 10 Residuals", "Unexplained_Residual_PnL"
+
+
+    buildStage = "Building top FX contributors"
+    DashBuildTopTable wsD, topPairRow, 15, 2, _
+        "Top 10 FX Translation Contributors", "PnL_FX"
+
+
+    topPairRow = topPairRow + DASH_TOP_N + 5
+
+
+    buildStage = "Building top hedge contributors"
+    DashBuildTopTable wsD, topPairRow, 1, 3, _
+        "Top 10 Expected Hedge PnL Contributors", "Hedge_Curve_Model_PnL"
+
+
+    buildStage = "Building top spread contributors"
+    DashBuildTopTable wsD, topPairRow, 15, 4, _
+        "Top 10 Credit and Spread Contributors", "SpreadPnL_Used"
+
+
+    dashRowCursor = topPairRow + DASH_TOP_N + 4
+
+
+    buildStage = "Building detailed BPV analysis"
+    DashBuildHedgeEfficiencyDetail wsD, lastRow, dashRowCursor + 2
+    buildStage = "Building risk-factor view"
+    DashBuildRiskFactorView wsD, dashRowCursor + 2
+    buildStage = "Building shared-framework validation"
+    DashBuildSharedFrameworkView wsD, lastRow, dashRowCursor + 2
+    buildStage = "Building hedge drift view"
+    DashBuildHedgeDriftView wsD, lastRow, dashRowCursor + 2
+    buildStage = "Building exact error locator"
+    DashBuildErrorLocator wsD, lastRow, dashRowCursor + 2
+    buildStage = "Building EUR/USD hedge view"
+    DashBuildFxHedgeView wsD, dashRowCursor + 2
+    buildStage = "Building quarantine view"
+    DashBuildQuarantineView wsD, lastRow, dashRowCursor + 2
+    buildStage = "Calculating Dashboard"
+
+
+    Application.StatusBar = "Dashboard: calculating Dashboard..."
+
+
+    Application.Calculation = oldCalc
+    wsD.Calculate
+    DoEvents
+    Application.Calculation = xlCalculationManual
+
+
+    buildStage = "Building charts"
+    DashBuildChartsSafe wsD
+
+
+    buildStage = "Formatting Dashboard"
+    DashFormatDashboard wsD
+
+
+    Application.Calculation = oldCalc
+    wsD.Calculate
+
+
+    buildCompleted = True
+
+
+CleanExit:
+
+
+    On Error Resume Next
+
+
+    Application.Calculation = oldCalc
+    Application.ScreenUpdating = oldScreen
+    Application.EnableEvents = oldEvents
+    Application.StatusBar = oldStatusBar
+
+
+    On Error GoTo 0
+
+
+    If buildCompleted Then
+
+
+        MsgBox _
+            "Dashboard rebuilt." & vbCrLf & vbCrLf & _
+            "Dashboard figures are live formulas, but only within the PNL range" & vbCrLf & _
+            "published by this build (rows " & CStr(DASH_DATA_ROW) & "-" & CStr(lastRow) & ")." & vbCrLf & vbCrLf & _
+            "Rebuild after adding or removing PNL rows, or when a new" & vbCrLf & _
+            "attribution-status or spread-framework value first appears.", _
+            vbInformation
+
+
+    End If
+
+
+    Exit Sub
+
+
+CleanFail:
+
+
+    eNumber = Err.Number
+    eDescription = Err.Description
+
+
+    On Error Resume Next
+
+
+    Application.Calculation = oldCalc
+    Application.ScreenUpdating = oldScreen
+    Application.EnableEvents = oldEvents
+    Application.StatusBar = oldStatusBar
+
+
+    On Error GoTo 0
+
+
+    MsgBox _
+        "Dashboard build failed." & vbCrLf & vbCrLf & _
+        "Stage: " & buildStage & vbCrLf & _
+        "Error " & CStr(eNumber) & ": " & eDescription, _
+        vbCritical
+
+
+End Sub
+
+
+' =============================================================================
+' SHEET HELPERS
+' =============================================================================
+
+
+Private Function DashGetOrCreateSheet( _
+    ByVal sheetName As String) As Worksheet
+
+
+    Dim ws As Worksheet
+
+
+    On Error Resume Next
+    Set ws = ThisWorkbook.Worksheets(sheetName)
+    On Error GoTo 0
+
+
+    If ws Is Nothing Then
+        Set ws = ThisWorkbook.Worksheets.Add( _
+            After:=ThisWorkbook.Worksheets(ThisWorkbook.Worksheets.Count))
+        ws.Name = sheetName
+    End If
+
+
+    Set DashGetOrCreateSheet = ws
+
+
+End Function
+
+
+Private Function DashGetRequiredSheet( _
+    ByVal sheetName As String) As Worksheet
+
+
+    Dim ws As Worksheet
+
+
+    On Error Resume Next
+    Set ws = ThisWorkbook.Worksheets(sheetName)
+    On Error GoTo 0
+
+
+    If ws Is Nothing Then
+        Err.Raise 9900, "DashGetRequiredSheet", _
+            "Required sheet not found: " & sheetName
+    End If
+
+
+    Set DashGetRequiredSheet = ws
+
+
+End Function
+
+
+Private Sub DashClear(ByVal ws As Worksheet)
+
+
+    Dim ch As chartObject
+    Dim shp As Shape
+    Dim i As Long
+
+
+    ws.Cells.ClearContents
+    ws.Cells.ClearFormats
+    ws.Columns.Hidden = False
+
+
+    For Each ch In ws.ChartObjects
+        ch.Delete
+    Next ch
+
+
+    ' Keep the buttons, delete everything else.
+    '
+    ' This used to spare one shape named "btnBuildDashboard6" - the single
+    ' button that existed before the three-button remake.  Nothing is called
+    ' that any more, so every build silently deleted all three buttons off the
+    ' sheet and the desk had to re-run InstallButtons to get them back.
+    '
+    ' Matched by prefix rather than by an exact list, so adding a fourth button
+    ' cannot reintroduce this.
+    For i = ws.Shapes.Count To 1 Step -1
+        Set shp = ws.Shapes(i)
+        If Left$(shp.Name, Len(DASH_BUTTON_PREFIX)) <> DASH_BUTTON_PREFIX Then
+            shp.Delete
+        End If
+    Next i
+
+
+End Sub
+
+
+' =============================================================================
+' PNL_ATTRIBUTION COLUMN CONTRACT
+'
+' This module never reads PNL_Attribution's header row and never uses a column
+' letter.  It refers to columns only as workbook NAMES - Pnl_Carry_Total rather
+' than $AP$5 - which modPNL publishes from its PnlLayout table.
+'
+' Two things follow, and both are the point:
+'
+'   MOVE a column and nothing here changes.  The next build republishes the
+'   name against the new letter and every formula below still resolves.
+'
+'   RENAME a column's header and nothing here changes either.  It used to: this
+'   module found its columns by searching row 4 for the header text, which made
+'   row 4 a machine interface wearing the costume of a label row.  Retitling L4
+'   to "Bond BPVs" for the desk to read - correct, obvious, and harmless-looking
+'   - made the search return Nothing and killed the whole build on error 9901
+'   before the first cell was drawn.  The keys are now separate from what the
+'   sheet displays, so row 4 may say anything, in any language.
+'
+' The keys are declared in ONE place: modPNL.PnlLayout.  See docs/COLUMNS.md.
+' =============================================================================
+
+
+Private Function DashRequiredPnlKeys() As Variant
+    DashRequiredPnlKeys = Array( _
+        "ISIN", "Name", "CCY", "Portfolio", _
+        "Official_Total_PnL", "Total_Model_Explained", "Unexplained_Residual_PnL", _
+        "PnL_Duration_Total", "PnL_OIS", "PnL_GovBasis", "PnL_SwapGovBasis", _
+        "SpreadPnL_Used", "PnL_Convexity", _
+        "Carry_Coupon", "Carry_RollToPar", "Funding_Carry_Memo", "Carry_Total", _
+        "PnL_FX", _
+        "Futures_Gov_Model_PnL", "Swap_Curve_Model_PnL", "Hedge_Curve_Model_PnL", _
+        "Hedge_Model_Residual_PnL", "Actual_Futures_PnL", "Actual_PlainSwap_PnL", _
+        "Bond_DV01_Current", "Hedge_DV01_Gap", _
+        "PlainSwap_DV01", "SyntheticSwap_DV01", _
+        "FuturesRTJ_DV01", "FuturesRT_DV01", _
+        "Actual_Hedge_DV01", "Residual_DV01", "Target_Hedge_DV01", _
+        "Hedge_Efficiency", "Hedge_Ratio", "Delta_Y_bp", _
+        "Attribution_Status", "Spread_Framework_Auto", "Spread_Framework_Reason", _
+        "Duration_Identity_Check", _
+        "Row_Valid", "Row_Exclusion_Reason", "FX_Exposure_EUR", _
+        "Bond_DV01_Opening", "Risk_Timing_Bias", "Coupon_Paid_EUR")
+End Function
+
+
+' The column behind one contract key, via the workbook name modPNL published
+' for it.
+'
+' This used to be Rows(4).Find(headerText) - a text search of the header row.
+' That made every string in PNL_Attribution row 4 part of the interface between
+' the two modules, so retitling a column for the desk ("Bond BPVs" instead of
+' "Bond_DV01_Current") stopped the search finding it and killed the entire
+' Dashboard build on 9901 before the first cell was drawn.  Row 4 is a row of
+' labels again; the names are the interface.
+'
+' Still raises 9901 when a name is missing, because that is a real broken
+' state - but now it means "the layout was never published", which Button 2
+' fixes, rather than "somebody renamed a cell", which nothing could.
+Private Function DashKeyCol(ByVal contractKey As String) As Long
+
+
+    Dim nm As Name
+
+
+    On Error GoTo Fail
+
+
+    Set nm = ThisWorkbook.Names(DASH_NAME_PREFIX & contractKey)
+    DashKeyCol = nm.RefersToRange.Column
+
+
+    Exit Function
+
+
+Fail:
+    Err.Raise _
+        9901, _
+        "DashKeyCol", _
+        "PNL_Attribution column name not published: " & _
+        DASH_NAME_PREFIX & contractKey & vbCrLf & _
+        "Run Button 2 (load hedges and attribute) - it publishes the layout."
+
+
+End Function
+
+
+' Every key the Dashboard is about to refer to must already have a name.
+' Touching them all here means a missing one is reported at the top of the
+' build with the key that is missing, rather than 900 formulas later as a
+' sheet full of #NAME?.
+Private Sub DashValidateSourceHeaders(ByVal wsP As Worksheet)
+
+
+    Dim headers As Variant
+    Dim headerName As Variant
+    Dim checkedColumn As Long
+
+
+    headers = DashRequiredPnlKeys()
+
+
+    For Each headerName In headers
+        checkedColumn = DashKeyCol(CStr(headerName))
+    Next headerName
+
+
+    If checkedColumn = 0 Then
+        Err.Raise 9901, "DashValidateSourceHeaders", _
+            "PNL_Attribution has no published columns."
+    End If
+
+
+End Sub
+
+
+' Publishing the layout is modPNL's job - it owns the table that says which
+' column is which.  This wrapper exists so the build reads in one place and so
+' the row count, which only the Dashboard has just measured, gets back to it.
+Private Sub DashDefinePnlNames( _
+    ByVal wsP As Worksheet, _
+    ByVal lastRow As Long)
+
+
+    If wsP Is Nothing Then Exit Sub
+
+
+    PublishPnlColumnNames lastRow
+
+
+End Sub
+
+
+Private Sub DashAddOrReplaceName( _
+    ByVal nameText As String, _
+    ByVal refersToText As String)
+
+
+    On Error Resume Next
+    ThisWorkbook.Names(nameText).Delete
+    On Error GoTo 0
+
+
+    If Left$(refersToText, 1) <> "=" Then refersToText = "=" & refersToText
+    ThisWorkbook.Names.Add Name:=nameText, RefersTo:=refersToText
+
+
+End Sub
+
+
+Private Function DashColLetter(ByVal colIndex As Long) As String
+
+
+    Dim n As Long
+    Dim s As String
+    Dim r As Long
+
+
+    n = colIndex
+
+
+    Do While n > 0
+        r = ((n - 1) Mod 26)
+        s = Chr$(65 + r) & s
+        n = (n - r - 1) \ 26
+    Loop
+
+
+    DashColLetter = s
+
+
+End Function
+
+
+' Last populated row of a hedge sheet, read from its key column.  Returns
+' DASH_DATA_ROW when the sheet is empty so the emitted range is still valid.
+Private Function DashHedgeLastRow( _
+    ByVal sheetName As String, _
+    ByVal keyCol As String) As Long
+
+    Dim ws As Worksheet
+    Dim lastRow As Long
+
+    On Error GoTo Fallback
+
+    Set ws = ThisWorkbook.Worksheets(sheetName)
+
+    lastRow = ws.Cells(ws.Rows.Count, ws.Range(keyCol & "1").Column).End(xlUp).Row
+
+    If lastRow < DASH_DATA_ROW Then GoTo Fallback
+
+    DashHedgeLastRow = lastRow
+    Exit Function
+
+Fallback:
+    DashHedgeLastRow = DASH_DATA_ROW
+
+End Function
+
+
+' Absolute one-column range over a hedge sheet's data rows.
+Private Function DashHedgeRange( _
+    ByVal col As String, _
+    ByVal lastRow As Long) As String
+
+    DashHedgeRange = "$" & col & "$" & CStr(DASH_DATA_ROW) & _
+                     ":$" & col & "$" & CStr(lastRow)
+
+End Function
+
+
+Private Function DashLastPnlRow(ByVal ws As Worksheet) As Long
+
+
+    Dim lastRow As Long
+
+
+    ' Chicken and egg: the ISIN column is found through a published name, and
+    ' the names are sized from the row count this measures.  So publish once at
+    ' whatever the sheet currently reaches, measure against that, and let the
+    ' caller republish at the exact size.  Both passes are cheap.
+    PublishPnlColumnNames ws.UsedRange.Row + ws.UsedRange.Rows.Count - 1
+
+    lastRow = ws.Cells( _
+        ws.Rows.Count, _
+        DashKeyCol("ISIN")).End(xlUp).Row
+
+
+    If lastRow < DASH_DATA_ROW Then
+        lastRow = DASH_DATA_ROW - 1
+    End If
+
+
+    DashLastPnlRow = lastRow
+
+
+End Function
+
+
+Private Function DashCleanText(ByVal value As Variant) As String
+
+
+    On Error Resume Next
+
+
+    If IsError(value) Then
+        DashCleanText = ""
+        Exit Function
+    End If
+
+
+    If IsNull(value) Or IsEmpty(value) Then
+        DashCleanText = ""
+        Exit Function
+    End If
+
+
+    DashCleanText = Trim$(CStr(value))
+
+
+End Function
+
+
+' =============================================================================
+' FORMULA BUILDERS
+'
+' One place that knows what a "detail row" is and how a column is summed, so a
+' change to either propagates to every figure on the sheet at once.
+' =============================================================================
+
+
+' The whole futures hedge, as one array expression.
+'
+' Futures risk arrives from TWO coverage books and is reported in two columns.
+' Anything that means "the futures hedge" has to add both; reading only
+' FuturesRTJ_DV01 would make every bond hedged out of the other book look
+' unhedged on this sheet while PNL_Attribution beside it says otherwise.
+Private Function DashFutDv01() As String
+    DashFutDv01 = "(N(" & DashN("FuturesRTJ_DV01") & ")+N(" & DashN("FuturesRT_DV01") & "))"
+End Function
+
+
+' The same total for one row, by position.
+Private Function DashFutDv01Index(ByVal n As Long) As String
+    DashFutDv01Index = "(IFERROR(INDEX(" & DashN("FuturesRTJ_DV01") & "," & n & "),0)" & _
+                       "+IFERROR(INDEX(" & DashN("FuturesRT_DV01") & "," & n & "),0))"
+End Function
+
+
+Private Function DashN(ByVal headerName As String) As String
+    DashN = DASH_NAME_PREFIX & headerName
+End Function
+
+
+' A detail row is one with an ISIN that is not a manually inserted total.
+' The match is EXACT: the previous substring test rejected any ISIN merely
+' containing "TOTAL", which would have dropped a real bond from every figure.
+' The rows every headline number on this sheet is taken over: a real bond, not
+' the TOTAL line, and not quarantined.
+'
+' Row_Valid is the whole point.  A bond whose attribution does not compute
+' contributes a number to some legs of the bridge and a blank to others, so
+' each line of the bridge ends up summed over a different set of bonds and the
+' bridge cannot tie.  Excluding it HERE, in the one criteria string every
+' SUMIFS on this sheet goes through, is what stops one broken row from moving
+' any other bond's number.  What was excluded is not hidden: the quarantine
+' block at the bottom of the sheet lists every dropped bond with its reason and
+' the PnL of the swaps and futures that went with it.
+Private Function DashDetailCriteria() As String
+    DashDetailCriteria = DashN("ISIN") & ",""<>""," & _
+        DashN("ISIN") & ",""<>TOTAL""," & _
+        DashN("Row_Valid") & ",1"
+End Function
+
+' The mirror image: the quarantined rows only.  Same shape as
+' DashDetailCriteria so the two partition the detail rows exactly - anything
+' dropped from the totals appears in the quarantine block, and nothing is
+' counted twice.
+Private Function DashQuarantineCriteria() As String
+    DashQuarantineCriteria = DashN("ISIN") & ",""<>""," & _
+        DashN("ISIN") & ",""<>TOTAL""," & _
+        DashN("Row_Valid") & ",0"
+End Function
+
+' SUMIFS over the quarantined rows only.
+' The book's actual PnL: the per-bond official totals plus the book-level
+' EUR/USD hedge, which has no bond row to sit on.  One expression, so the KPI,
+' the bridge's Actual line and every "% of Actual" are shares of the same
+' number - they were shares of three slightly different ones otherwise.
+Private Function DashActualTotalExpr() As String
+    DashActualTotalExpr = DashSumFml("Official_Total_PnL") & "+" & _
+        DashFxHedgeSumFml(DASH_FUT_PNL_COL)
+End Function
+
+
+Private Function DashSumQuarantinedFml(ByVal headerName As String) As String
+    DashSumQuarantinedFml = "SUMIFS(" & DashN(headerName) & "," & _
+        DashQuarantineCriteria() & ")"
+End Function
+
+
+' 1 for a row inside the totals, 0 for a quarantined or empty one.
+'
+' The SUMIFS-based totals get this through DashDetailCriteria, but the book
+' weights are SUMPRODUCTs - SUMIFS cannot express "framework = X weighted by
+' BPV" - so they need the same filter written as a mask.  Without it the
+' weights described a different book from every figure above them.
+Private Function DashValidMask() As String
+    DashValidMask = "--(N(" & DashN("Row_Valid") & ")=1)"
+End Function
+
+
+' BPV of the rows in the totals, restricted to the ones matching `condition`.
+Private Function DashBpvWeightExpr(ByVal condition As String) As String
+    DashBpvWeightExpr = "SUMPRODUCT(" & DashValidMask() & ",--(" & condition & _
+        "),ABS(N(" & DashN("Bond_DV01_Current") & ")))"
+End Function
+
+
+' The denominator every book weight is a share of.
+Private Function DashBpvTotalExpr() As String
+    DashBpvTotalExpr = "SUMPRODUCT(" & DashValidMask() & _
+        ",ABS(N(" & DashN("Bond_DV01_Current") & ")))"
+End Function
+
+
+' SUMIFS over the detail rows of one column.
+Private Function DashSumFml(ByVal headerName As String) As String
+    DashSumFml = "SUMIFS(" & DashN(headerName) & "," & DashDetailCriteria() & ")"
+End Function
+
+
+' Rows that actually produced a Total_Model_Explained.  ">=-1E+307" matches
+' numeric cells only, so rows carrying "" (missing data, or a framework set to
+' REVIEW) are excluded.
+Private Function DashAttributedCriteria() As String
+    DashAttributedCriteria = DashDetailCriteria() & "," & _
+        DashN("Total_Model_Explained") & ","">=-1E+307"""
+End Function
+
+
+' SUMIFS restricted to the attributed rows.
+'
+' Every line of the bridge MUST use this.  A component summed over all rows but
+' compared against a total built only from rows that fully attributed cannot
+' add up: the difference is the components of the rows that dropped out, which
+' looks like a broken model when it is really missing data.
+Private Function DashSumAttributedFml(ByVal headerName As String) As String
+    DashSumAttributedFml = "SUMIFS(" & DashN(headerName) & "," & _
+        DashAttributedCriteria() & ")"
+End Function
+
+
+' SUMIFS over the detail rows of one column, restricted to the rows whose spread
+' framework is one of `frameworks`.  Used by the "of which" memo lines, where
+' which legs exist depends on the framework the row resolved to.
+Private Function DashSumFmlForFrameworks( _
+    ByVal headerName As String, _
+    ByVal frameworks As Variant) As String
+
+
+    Dim i As Long
+    Dim f As String
+
+
+    For i = LBound(frameworks) To UBound(frameworks)
+        If i > LBound(frameworks) Then f = f & "+"
+        f = f & "SUMIFS(" & DashN(headerName) & "," & DashAttributedCriteria() & _
+            "," & DashN("Spread_Framework_Auto") & ",""" & CStr(frameworks(i)) & """)"
+    Next i
+
+
+    DashSumFmlForFrameworks = f
+
+
+End Function
+
+
+Private Function DashCountDetailFml() As String
+    DashCountDetailFml = "COUNTIFS(" & DashDetailCriteria() & ")"
+End Function
+
+
+' Blank rather than a division error, written the same way everywhere.
+'
+' Both operands are parenthesised.  Without that, a compound numerator such as
+' "SUM(a)-SUM(b)" emitted  a-b/c  rather than  (a-b)/c , because "/" binds
+' tighter than "-" - which silently turned the portfolio hedge-efficiency tile
+' into "actual hedge DV01 + 1".
+Private Function DashSafeDiv( _
+    ByVal numerator As String, _
+    ByVal denominator As String) As String
+
+
+    DashSafeDiv = "IFERROR((" & numerator & ")/(" & denominator & "),"""")"
+
+
+End Function
+
+
+' =============================================================================
+' HEADER BANNER
+' =============================================================================
+
+
+Private Sub DashBuildHeader(ByVal ws As Worksheet)
+
+
+    Dim cfg As String
+
+
+    cfg = "'" & DASH_SH_CONFIG & "'!"
+
+
+    ws.Range("A1").value = "PNL Dashboard | Desk Overview"
+
+
+    With ws.Range("A1:L1")
+        .Merge
+        .Font.Size = 20
+        .Font.Bold = True
+    End With
+
+
+    ' Dates are LINKED, not copied, so the banner cannot claim one period while
+    ' the figures below were computed for another.
+    ws.Range("A3").value = "T-1 Date"
+    ws.Range("B3").formula = "=" & cfg & DASH_CFG_T_MINUS_1_DATE
+    ws.Range("B3").numberFormat = "dd/mm/yyyy"
+
+
+    ws.Range("C3").value = "T0 Date"
+    ws.Range("D3").formula = "=" & cfg & DASH_CFG_T0_DATE
+    ws.Range("D3").numberFormat = "dd/mm/yyyy"
+
+
+    ' INT() on both ends: Config!B4 may carry a snapshot time component, and a
+    ' fractional period here would misstate every carry figure below.
+    ws.Range("E3").value = "Period Days"
+    ws.Range("F3").formula = _
+        "=IF(OR(NOT(ISNUMBER(B3)),NOT(ISNUMBER(D3))),""""," & _
+        "INT(D3)-INT(B3))"
+
+
+    ws.Range("H3").value = "Dashboard built at"
+    ws.Range("I3").value = Now
+    ws.Range("I3").numberFormat = "dd/mm/yyyy hh:mm"
+
+
+    ' Staleness: is this Dashboard older than the data underneath it?
+    '
+    ' It used to compare the build stamp against Config!B49, the moment the T0
+    ' snapshot was frozen.  Nothing freezes anything now - both snapshots are
+    ' live formulas - so B49 is never written, and the cell read "T0 not frozen"
+    ' on every build for ever, next to advice to press a button that no longer
+    ' exists.  A permanent warning is not a warning.
+    '
+    ' Config!B24 is the stamp that still means something: when market data was
+    ' last refreshed.  A Dashboard built before that is showing older numbers
+    ' than the workbook holds, which is the one staleness the desk can act on.
+    ws.Range("K3").value = "Data"
+    ws.Range("L3").formula = _
+        "=IF(NOT(ISNUMBER(" & cfg & DASH_CFG_LAST_REFRESH & "))," & _
+        """no refresh recorded""," & _
+        "IF(I3<" & cfg & DASH_CFG_LAST_REFRESH & "," & _
+        """STALE - rebuild (Button 3)"",""current""))"
+
+
+    ws.Range("A5").value = "Source"
+    ws.Range("B5").value = _
+        "PNL_Attribution - live formulas, not a snapshot"
+
+
+    ws.Range("D5").value = "Run order"
+    ws.Range("E5").value = _
+        "1 Load bonds   >   2 Load hedges + attribute   >   3 Build dashboard"
+
+
+    With ws.Range("A1:L5")
+        .Interior.Color = RGB(31, 78, 121)
+        .Font.Color = RGB(255, 255, 255)
+    End With
+
+
+    ws.Range("A3:L3").Font.Bold = True
+
+
+End Sub
+
+
+' =============================================================================
+' KPI TILES
+' =============================================================================
+
+
+Private Sub DashBuildKpis(ByVal ws As Worksheet)
+
+
+    Dim futures As String
+    Dim swaps As String
+
+
+    futures = "'" & DASH_SH_FUTURES & "'!"
+    swaps = "'" & DASH_SH_SWAPS & "'!"
+
+
+    ' --- row 1: does the book's PnL add up? --------------------------------
+    DashKpi ws, "A7", "Actual PnL", "=" & DashActualTotalExpr(), "#,##0"
+    DashKpi ws, "C7", "Total Explained", "=" & DashSumFml("Total_Model_Explained"), "#,##0"
+    DashKpi ws, "E7", "Unexplained Residual", "=" & DashSumFml("Unexplained_Residual_PnL"), "#,##0"
+
+
+    DashKpi ws, "G7", "Residual % of Actual", _
+        "=" & DashSafeDiv(DashSumFml("Unexplained_Residual_PnL"), _
+                          "ABS(" & DashActualTotalExpr() & ")"), "0.00%"
+
+
+    DashKpi ws, "I7", "Bonds In These Totals", "=" & DashCountDetailFml(), "0"
+
+
+    ' The headline the reader needs before trusting anything else on this sheet:
+    ' how many bonds are NOT in the numbers above.  Every figure on the Dashboard
+    ' is taken over Row_Valid = 1, so a book of 200 bonds reported as 200 and a
+    ' book of 200 bonds reported as 173 are different statements, and the second
+    ' one used to look exactly like the first.  The names and reasons are in the
+    ' quarantine block at the bottom of the sheet.
+    DashKpi ws, "K7", "Bonds Quarantined (excluded)", _
+        "=COUNTIFS(" & DashQuarantineCriteria() & ")", "0"
+
+
+    ' --- row 2: the hedge -----------------------------------------------------
+    DashKpi ws, "A11", "Hedge PnL (model)", "=" & DashSumFml("Hedge_Curve_Model_PnL"), "#,##0"
+    DashKpi ws, "C11", "Futures PnL (model)", "=" & DashSumFml("Futures_Gov_Model_PnL"), "#,##0"
+    DashKpi ws, "E11", "Plain Swap PnL (model)", "=" & DashSumFml("Swap_Curve_Model_PnL"), "#,##0"
+
+
+    ' Hedge basis = actual hedge PnL less what the curve model said it should be.
+    ' Now an explained bucket rather than a silent component of the residual.
+    DashKpi ws, "G11", "Hedge Basis (actual - model)", _
+        "=" & DashSumFml("Hedge_Model_Residual_PnL"), "#,##0"
+
+
+    DashKpi ws, "I11", "FX Translation", "=" & DashSumFml("PnL_FX"), "#,##0"
+
+
+    ' Portfolio efficiency nets offsetting per-bond errors, so it always reads
+    ' better than the distribution below.  Both are shown deliberately.
+    '
+    ' Same definition as the per-bond column: 1 - |actual - target| / |target|.
+    ' It is an EFFICIENCY, so the leading 1 matters; the ratio on its own is the
+    ' error, which reads as a good score when it is closest to zero.
+    DashKpi ws, "K11", "Portfolio Hedge Efficiency", _
+        "=IF(SUMIFS(" & DashN("Target_Hedge_DV01") & "," & DashDetailCriteria() & ")=0,""""," & _
+        "1-" & DashSafeDiv( _
+            "ABS(SUMIFS(" & DashN("Actual_Hedge_DV01") & "," & DashDetailCriteria() & ")-" & _
+            "SUMIFS(" & DashN("Target_Hedge_DV01") & "," & DashDetailCriteria() & "))", _
+            "ABS(SUMIFS(" & DashN("Target_Hedge_DV01") & "," & DashDetailCriteria() & "))") & ")", _
+        "0.00%"
+
+
+    ' --- row 3: what the sheet cannot see ------------------------------------
+    ' Hedges are matched to bonds by ISIN only.  A hedge with a blank LinkedISIN
+    ' is on NO PNL_Attribution row, so its PnL is missing from every figure
+    ' above.  Quantifying that leakage is the only honest way to present totals.
+    Dim futLast As Long
+    Dim swapLast As Long
+
+    futLast = DashHedgeLastRow(DASH_SH_FUTURES, DASH_FUT_KEY_COL)
+    swapLast = DashHedgeLastRow(DASH_SH_SWAPS, DASH_SWAP_KEY_COL)
+
+    DashKpi ws, "A15", "Unlinked Futures PnL", _
+        "=SUMIFS(" & futures & DashHedgeRange(DASH_FUT_PNL_COL, futLast) & "," & _
+        futures & DashHedgeRange(DASH_FUT_LINK_COL, futLast) & ","""")", "#,##0"
+
+
+    DashKpi ws, "C15", "Unlinked Swap PnL", _
+        "=SUMIFS(" & swaps & DashHedgeRange(DASH_SWAP_PNL_COL, swapLast) & "," & _
+        swaps & DashHedgeRange(DASH_SWAP_LINK_COL, swapLast) & ","""")", "#,##0"
+
+
+    ' Hedges attach to bonds by ISIN, so if the same ISIN appears on more than
+    ' one PNL row - the same bond held in two portfolios, say - EVERY one of
+    ' those rows claims the FULL hedge PnL and DV01 of that ISIN.  Any non-zero
+    ' count here means hedge figures above are overstated.
+    DashKpi ws, "E15", "Rows Sharing an ISIN", _
+        "=SUMPRODUCT((" & DashN("ISIN") & "<>"""")*" & _
+        "(COUNTIF(" & DashN("ISIN") & "," & DashN("ISIN") & ")>1))", "0"
+
+
+    ' Rows where the framework chain does not reproduce -DV01 x Delta_y.  A
+    ' non-zero count means stale inputs, not a wrong model.
+    DashKpi ws, "G15", "Duration Chain Breaks", _
+        "=COUNTIFS(" & DashDetailCriteria() & "," & _
+        DashN("Attribution_Status") & ",""Duration chain does not tie"")", "0"
+
+
+    ' Identically zero when the bridge is coherent; anything else means some row
+    ' has an Actual or Explained that did not flow into the residual.
+    DashKpi ws, "I15", "Bridge Tie-Out (want 0)", _
+        "=" & DashSumFml("Official_Total_PnL") & "-" & _
+        DashSumFml("Total_Model_Explained") & "-" & _
+        DashSumFml("Unexplained_Residual_PnL"), "#,##0.00"
+
+
+    DashKpi ws, "K15", "Funding Carry (memo)", _
+        "=" & DashSumFml("Funding_Carry_Memo"), "#,##0"
+
+
+    ' --- row 4: how the spread framework was actually allocated ---------------
+    ' Weighted BPV shares of the WHOLE book, so a desk can see at a glance which
+    ' curve the credit leg is being measured against overall.
+    '
+    ' Weighted by Bond_DV01_Current.  These used to weight by a "DV01_EUR"
+    ' named range that was never defined - DashDefinePnlNames only publishes the
+    ' headers in DashRequiredPnlKeys, and DV01_EUR was not among them - so
+    ' every share below evaluated to #NAME?.  The column it pointed at was a
+    ' leftover blank on PNL_Attribution: the bond's DV01 in EUR moved to
+    ' Bond_DV01_Current (= Bonds!DV01_EUR) and only the old header stayed
+    ' behind.  Same quantity, one that actually exists.
+    DashKpi ws, "A19", "Book Weight: Government", _
+        "=" & DashSafeDiv( _
+            DashBpvWeightExpr(DashN("Spread_Framework_Auto") & "=""G"""), _
+            DashBpvTotalExpr()), "0.0%"
+    DashKpi ws, "C19", "Book Weight: EURIBOR Swap", _
+        "=" & DashSafeDiv( _
+            DashBpvWeightExpr(DashN("Spread_Framework_Auto") & "=""I"""), _
+            DashBpvTotalExpr()), "0.0%"
+    DashKpi ws, "E19", "Book Weight: OIS (ESTR/SOFR)", _
+        "=" & DashSafeDiv( _
+            DashBpvWeightExpr("(" & DashN("Spread_Framework_Auto") & "=""OIS"")+(" & _
+                DashN("Spread_Framework_Auto") & "=""SOFR"")>0"), _
+            DashBpvTotalExpr()), "0.0%"
+    DashKpi ws, "G19", "Book Weight: Unhedged", _
+        "=" & DashSafeDiv( _
+            "SUMPRODUCT(" & DashValidMask() & ",IF(ABS(N(" & DashN("Bond_DV01_Current") & "))>ABS" & DashFutDv01() & "+ABS(N(" & DashN("PlainSwap_DV01") & ")),ABS(N(" & DashN("Bond_DV01_Current") & "))-ABS" & DashFutDv01() & "-ABS(N(" & DashN("PlainSwap_DV01") & ")),0))", _
+            DashBpvTotalExpr()), "0.0%"
+    DashKpi ws, "I19", "Hedge BPV Coverage (uncapped)", _
+        "=" & DashSafeDiv( _
+            "SUMPRODUCT(" & DashValidMask() & ",ABS" & DashFutDv01() & "+ABS(N(" & DashN("PlainSwap_DV01") & ")))", _
+            DashBpvTotalExpr()), "0.0%"
+    ' Was "Residual from DV01 Timing", built from Bond_DV01_Change_Approx.  That
+    ' column is gone: it re-derived the OPENING bond risk on PNL_Attribution from
+    ' Bonds!DirtyMV_T-1 and a duration, which is a weaker second copy of a figure
+    ' Bonds already holds.  The hedge gap answers a question the desk can act on
+    ' and comes from a column that is actually maintained.
+    DashKpi ws, "K19", "Hedge BPV Gap (actual less target)", _
+        "=SUMIFS(" & DashN("Hedge_DV01_Gap") & "," & DashDetailCriteria() & ")", "#,##0"
+
+
+    ws.Range("A7:L21").Borders.LineStyle = xlContinuous
+
+
+End Sub
+
+
+Private Sub DashKpi( _
+    ByVal ws As Worksheet, _
+    ByVal topLeft As String, _
+    ByVal title As String, _
+    ByVal metricFormula As String, _
+    ByVal numberFormat As String)
+
+
+    Dim rg As Range
+
+
+    Set rg = ws.Range(topLeft).Resize(3, 2)
+
+
+    rg.UnMerge
+    rg.ClearContents
+
+
+    rg.Cells(1, 1).value = title
+    rg.Cells(2, 1).formula = metricFormula
+
+
+    rg.Cells(1, 1).Resize(1, 2).Merge
+    rg.Cells(2, 1).Resize(2, 2).Merge
+
+
+    With rg.Cells(1, 1)
+        .Font.Bold = True
+        .Font.Size = 9
+        .HorizontalAlignment = xlCenter
+        .WrapText = True
+    End With
+
+
+    With rg.Cells(2, 1)
+        .Font.Bold = True
+        .Font.Size = 16
+        .HorizontalAlignment = xlCenter
+        .numberFormat = numberFormat
+    End With
+
+
+    rg.Interior.Color = RGB(221, 235, 247)
+
+
+End Sub
+
+
+' =============================================================================
+' PNL FACTOR BRIDGE
+'
+' Reads top to bottom as an actual bridge:
+'
+'     Rates & Spread (duration)
+'   + Convexity
+'   + Carry
+'   + FX
+'   + Hedge PnL (model)
+'   + Hedge basis
+'   ------------------------------
+'   = Total Explained
+'   + Unexplained residual
+'   ------------------------------
+'   = Actual PnL
+'
+' The four "of which" lines under the duration total are MEMO lines, indented
+' and excluded from the sum.  Adding those legs directly - which is what this
+' block used to do - double counts, because which legs make up a row's duration
+' total depends on that row's spread framework: a G-framework row has no
+' Swap-Gov leg in its chain at all, so summing the Swap-Gov column across every
+' row inflated the bridge by exactly the G rows' share of it.
+'
+' Two tie-out rows prove the arithmetic instead of asserting it.
+' =============================================================================
+
+
+Private Sub DashBuildFactorBridge(ByVal ws As Worksheet)
+
+
+    Dim r As Long
+    Dim firstComponent As Long
+    Dim lastComponent As Long
+    Dim durationRow As Long
+    Dim firstMemo As Long
+    Dim lastMemo As Long
+    Dim explainedRow As Long
+    Dim residualRow As Long
+    Dim notAttributedRow As Long
+    Dim fxHedgeRow As Long
+    Dim actualRow As Long
+
+
+    ' Frameworks whose duration chain contains each leg.
+    '
+    ' MIXED is excluded from all three.  Its duration total is a DV01-weighted
+    ' blend of the govie and swap chains, so its legs do not enter at weight 1
+    ' and attributing them in full would overstate the memo.  A blended row has
+    ' no honest per-leg split, so its whole duration total falls into the
+    ' "not separately split" line, along with the undecomposed OIS/SOFR rows.
+    Dim curveFwks As Variant
+    Dim swapGovFwks As Variant
+    Dim spreadFwks As Variant
+
+
+    curveFwks = Array("G", "I", "ASW", "Z", "OAS")
+    swapGovFwks = Array("I", "ASW", "Z", "OAS")
+    spreadFwks = Array("G", "I", "ASW", "Z", "OAS", "OIS", "SOFR")
+
+
+    ws.Range("A24").value = _
+        "PnL Attribution and Hedge Bridge (rows that attributed; see 'Not attributed')"
+    ws.Range("A24").Font.Bold = True
+    ws.Range("A24").Font.Size = 12
+
+
+    ws.Range("A26:C26").value = Array("Component", "PnL EUR", "% Actual")
+    ws.Range("A26:C26").Font.Bold = True
+
+
+    r = 27
+    firstComponent = r
+    durationRow = r
+
+
+    DashBridgeRow ws, r, "Rates & Spread (duration)", _
+        DashSumAttributedFml("PnL_Duration_Total"), False
+    r = r + 1
+
+
+    ' --- memo: how the duration total splits, per the selected framework ------
+    firstMemo = r
+
+
+    DashBridgeMemoRow ws, r, "of which OIS rate", _
+        DashSumFmlForFrameworks("PnL_OIS", curveFwks)
+    r = r + 1
+
+
+    DashBridgeMemoRow ws, r, "of which Gov-OIS basis", _
+        DashSumFmlForFrameworks("PnL_GovBasis", curveFwks)
+    r = r + 1
+
+
+    DashBridgeMemoRow ws, r, "of which Swap-Gov basis", _
+        DashSumFmlForFrameworks("PnL_SwapGovBasis", swapGovFwks)
+    r = r + 1
+
+
+    DashBridgeMemoRow ws, r, "of which credit / spread", _
+        DashSumFmlForFrameworks("SpreadPnL_Used", spreadFwks)
+    r = r + 1
+
+
+    ' Balancing memo line: the OIS/SOFR frameworks are undecomposed and MIXED is
+    ' a weighted blend, so the four lines above cannot tie to the duration total
+    ' on their own.  This line is the remainder, which makes the memo block tie
+    ' exactly rather than "nearly".
+    DashBridgeMemoRow ws, r, "of which not separately split (OIS/SOFR/MIXED)", _
+        "B" & CStr(durationRow) & "-SUM(B" & CStr(firstMemo) & ":B" & CStr(r - 1) & ")"
+    lastMemo = r
+    r = r + 1
+
+
+    ' --- back to the bridge proper --------------------------------------------
+    DashBridgeRow ws, r, "Convexity", DashSumAttributedFml("PnL_Convexity"), False
+    r = r + 1
+
+
+    DashBridgeRow ws, r, "Carry (coupon + roll to par)", _
+        DashSumAttributedFml("Carry_Total"), False
+    r = r + 1
+
+
+    DashBridgeRow ws, r, "FX translation / revaluation", _
+        DashSumAttributedFml("PnL_FX"), False
+    r = r + 1
+
+
+    DashBridgeRow ws, r, "Hedge PnL (curve model)", _
+        DashSumAttributedFml("Hedge_Curve_Model_PnL"), False
+    r = r + 1
+
+
+    DashBridgeRow ws, r, "Hedge basis (actual - model)", _
+        DashSumAttributedFml("Hedge_Model_Residual_PnL"), False
+    r = r + 1
+
+    ' The EUR/USD hedge is a BOOK-level position, so it has no PNL_Attribution
+    ' row to be summed from and is taken straight off the Futures sheet.
+    '
+    ' It has to be here.  The bond side of the currency hedge - the translation
+    ' of the non-EUR positions - is already in the bridge as "FX translation".
+    ' Leaving the contracts that cancel it out of the bridge would report the
+    ' translation gross, with nothing against it, and hand the reader a currency
+    ' result the desk deliberately does not run.  It is added to the Actual line
+    ' below by the same amount, so the tie-outs are unaffected.
+    fxHedgeRow = r
+    DashBridgeRow ws, r, "FX hedge (EUR/USD contracts, book level)", _
+        DashFxHedgeSumFml(DASH_FUT_PNL_COL), False
+    lastComponent = r
+    r = r + 1
+
+
+    ' NOTE ON LABELS: none of these may begin with "=" or "+".  Excel parses a
+    ' string assigned to .Value that starts with an operator as a FORMULA, so
+    ' "= Total Explained" lands in the cell as #NAME?.  Emphasis is carried by
+    ' bold, not by leading operators.
+    explainedRow = r
+    DashBridgeRow ws, r, "Total Explained", _
+        DashSumFml("Total_Model_Explained") & "+B" & CStr(fxHedgeRow), True
+    r = r + 1
+
+
+    residualRow = r
+    DashBridgeRow ws, r, "Unexplained residual", DashSumFml("Unexplained_Residual_PnL"), False
+    r = r + 1
+
+
+    ' A row whose Total_Model_Explained is blank - missing market data, or a
+    ' framework set to REVIEW - still HAS an Official PnL.  It therefore appears
+    ' in the Actual total but in neither Explained nor Residual, and without this
+    ' line the portfolio bridge silently fails to add up even though every
+    ' individual row's bridge is correct.  ">=-1E+307" matches numeric cells
+    ' only, so rows carrying "" are the ones counted here.
+    notAttributedRow = r
+    ' Since the quarantine went in this line should read 0: a row with no
+    ' explained PnL fails Row_Valid and is no longer inside DashDetailCriteria
+    ' at all.  It is kept as the tie-out that PROVES that, and it is where a
+    ' future gap between the two definitions would show up first.
+    DashBridgeRow ws, r, "Not attributed (0 once quarantined; see the block at the bottom)", _
+        DashSumFml("Official_Total_PnL") & "-SUMIFS(" & _
+        DashN("Official_Total_PnL") & "," & DashDetailCriteria() & "," & _
+        DashN("Total_Model_Explained") & ","">=-1E+307"")", False
+    r = r + 1
+
+
+    actualRow = r
+    DashBridgeRow ws, r, "Actual PnL", _
+        DashSumFml("Official_Total_PnL") & "+B" & CStr(fxHedgeRow), True
+    r = r + 1
+
+
+    ' --- tie-outs -------------------------------------------------------------
+    r = r + 1
+
+
+    ws.Cells(r, 1).value = "Check: components - Total Explained (want 0)"
+    ws.Cells(r, 2).formula = _
+        "=SUM(B" & CStr(firstComponent) & ":B" & CStr(lastComponent) & _
+        ")-SUM(B" & CStr(firstMemo) & ":B" & CStr(lastMemo) & _
+        ")-B" & CStr(explainedRow)
+    ws.Cells(r, 2).numberFormat = "#,##0.00"
+    ws.Cells(r, 1).Font.Italic = True
+    r = r + 1
+
+
+    ws.Cells(r, 1).value = "Check: Explained + Residual + Not attributed - Actual (want 0)"
+    ws.Cells(r, 2).formula = _
+        "=B" & CStr(explainedRow) & "+B" & CStr(residualRow) & _
+        "+B" & CStr(notAttributedRow) & "-B" & CStr(actualRow)
+    ws.Cells(r, 2).numberFormat = "#,##0.00"
+    ws.Cells(r, 1).Font.Italic = True
+    r = r + 1
+
+
+    ' Funding is economic carry, not mark-to-market PnL.  Official_Total_PnL is a
+    ' MTM proxy with no financing leg, so putting funding in the bridge would
+    ' open a residual exactly equal to it.  Shown here, outside the bridge.
+    r = r + 1
+    ws.Cells(r, 1).value = "Memo: funding carry (not in bridge)"
+    ws.Cells(r, 2).formula = "=" & DashSumFml("Funding_Carry_Memo")
+    r = r + 1
+
+    ' Coupon CASH is inside Actual PnL, not a bridge component - the accrual
+    ' side of the same money is already in Carry.  Shown so the reader can see
+    ' how much of today''s actual number is a coupon date rather than a move.
+    ws.Cells(r, 1).value = "Memo: coupon cash received (inside Actual PnL)"
+    ws.Cells(r, 2).formula = "=" & DashSumFml("Coupon_Paid_EUR")
+    ws.Cells(r, 2).numberFormat = "#,##0"
+    ws.Cells(r, 1).Font.Italic = True
+    r = r + 1
+
+    ' What attributing on opening rather than closing risk is worth.  Small
+    ' means the book did not change size during the day and the choice of
+    ' anchor does not matter; large means it did, and no single-point
+    ' attribution is telling the whole story about that bond.
+    ws.Cells(r, 1).value = "Memo: opening vs closing risk anchor (size of the timing choice)"
+    ws.Cells(r, 2).formula = "=" & DashSumFml("Risk_Timing_Bias")
+    ws.Cells(r, 2).numberFormat = "#,##0"
+    ws.Cells(r, 1).Font.Italic = True
+    ws.Cells(r, 2).numberFormat = "#,##0"
+    ws.Cells(r, 1).Font.Italic = True
+
+
+    ws.Range("B27:B" & CStr(r)).numberFormat = "#,##0"
+    ws.Range("C27:C" & CStr(actualRow)).numberFormat = "0.00%"
+    ws.Range("A26:C" & CStr(actualRow)).Borders.LineStyle = xlContinuous
+
+
+    ' Chart source is a TWO-AREA range that skips the memo block, so each factor
+    ' is plotted exactly once.  A single contiguous range would plot the "of
+    ' which" lines alongside the duration total they are part of, which reads as
+    ' though the book earned that PnL twice.
+    DashAddOrReplaceName "DashChartBridge", _
+        "'" & DASH_SH_DASH & "'!$A$26:$B$" & CStr(durationRow) & "," & _
+        "'" & DASH_SH_DASH & "'!$A$" & CStr(lastMemo + 1) & ":$B$" & CStr(actualRow)
+
+
+    dashRowCursor = r
+
+
+End Sub
+
+
+Private Sub DashBridgeRow( _
+    ByVal ws As Worksheet, _
+    ByVal rowNum As Long, _
+    ByVal label As String, _
+    ByVal amountFormula As String, _
+    ByVal isBold As Boolean)
+
+
+    ws.Cells(rowNum, 1).value = label
+    ws.Cells(rowNum, 2).formula = "=" & amountFormula
+
+
+    ws.Cells(rowNum, 3).formula = _
+        "=" & DashSafeDiv("B" & CStr(rowNum), _
+                          "ABS(" & DashActualTotalExpr() & ")")
+
+
+    If isBold Then
+        ws.Cells(rowNum, 1).Resize(1, 3).Font.Bold = True
+    End If
+
+
+End Sub
+
+
+' Indented, italic, and NOT part of any bridge subtotal.
+Private Sub DashBridgeMemoRow( _
+    ByVal ws As Worksheet, _
+    ByVal rowNum As Long, _
+    ByVal label As String, _
+    ByVal amountFormula As String)
+
+
+    ws.Cells(rowNum, 1).value = "    " & label
+    ws.Cells(rowNum, 2).formula = "=" & amountFormula
+
+
+    ws.Cells(rowNum, 3).formula = _
+        "=" & DashSafeDiv("B" & CStr(rowNum), _
+                          "ABS(" & DashActualTotalExpr() & ")")
+
+
+    ws.Cells(rowNum, 1).Resize(1, 3).Font.Italic = True
+    ws.Cells(rowNum, 1).Font.Color = RGB(89, 89, 89)
+
+
+End Sub
+
+
+' =============================================================================
+' CARRY BREAKDOWN
+' =============================================================================
+
+
+Private Sub DashBuildCarrySummary(ByVal ws As Worksheet)
+
+
+    Dim top As Long
+    Dim firstPart As Long
+
+
+    top = dashRowCursor + 2
+
+
+    ws.Cells(top, 1).value = "Carry Breakdown"
+    ws.Cells(top, 1).Font.Bold = True
+    ws.Cells(top, 1).Font.Size = 12
+
+
+    ws.Cells(top + 2, 1).Resize(1, 2).value = Array("Carry Component", "PnL EUR")
+    ws.Cells(top + 2, 1).Resize(1, 2).Font.Bold = True
+
+
+    firstPart = top + 3
+
+
+    ws.Cells(firstPart, 1).value = "Coupon accrual"
+    ws.Cells(firstPart, 2).formula = "=" & DashSumFml("Carry_Coupon")
+
+
+    ws.Cells(firstPart + 1, 1).value = "Roll to par"
+    ws.Cells(firstPart + 1, 2).formula = "=" & DashSumFml("Carry_RollToPar")
+
+
+    ' SUM of the parts above, not an independent re-sum of the source column.
+    ' Re-summing meant the parts could silently fail to add up to the total with
+    ' nothing on the sheet revealing it.
+    ws.Cells(firstPart + 2, 1).value = "Total Carry (in bridge)"
+    ws.Cells(firstPart + 2, 2).formula = _
+        "=SUM(B" & CStr(firstPart) & ":B" & CStr(firstPart + 1) & ")"
+    ws.Cells(firstPart + 2, 1).Resize(1, 2).Font.Bold = True
+
+
+    ' Below the total and visually separated: funding is economic carry, not part
+    ' of the mark-to-market bridge.  See DashBuildFactorBridge.
+    ws.Cells(firstPart + 4, 1).value = "Funding carry (memo, not in bridge)"
+    ws.Cells(firstPart + 4, 2).formula = "=" & DashSumFml("Funding_Carry_Memo")
+    ws.Cells(firstPart + 4, 1).Resize(1, 2).Font.Italic = True
+
+
+    ws.Cells(firstPart + 5, 1).value = "Economic carry (total + funding)"
+    ws.Cells(firstPart + 5, 2).formula = _
+        "=B" & CStr(firstPart + 2) & "+B" & CStr(firstPart + 4)
+    ws.Cells(firstPart + 5, 1).Resize(1, 2).Font.Italic = True
+
+
+    ws.Range("B" & CStr(firstPart) & ":B" & CStr(firstPart + 5)).numberFormat = "#,##0"
+    ws.Range("A" & CStr(top + 2) & ":B" & CStr(firstPart + 2)).Borders.LineStyle = xlContinuous
+
+
+    DashAddOrReplaceName "DashChartCarry", _
+        "'" & DASH_SH_DASH & "'!$A$" & CStr(top + 2) & ":$B$" & CStr(firstPart + 1)
+
+
+    dashRowCursor = firstPart + 5
+
+
+End Sub
+
+
+' =============================================================================
+' HEDGE ANALYTICS
+' =============================================================================
+
+
+Private Sub DashBuildHedgeSummary(ByVal ws As Worksheet)
+
+
+    Dim top As Long
+    Dim r As Long
+    Dim firstPnl As Long
+    Dim lastPnl As Long
+    Dim actualBpvRow As Long
+    Dim targetBpvRow As Long
+
+
+    top = dashRowCursor + 2
+
+
+    ws.Cells(top, 1).value = "Hedge Analytics"
+    ws.Cells(top, 1).Font.Bold = True
+    ws.Cells(top, 1).Font.Size = 12
+
+
+    ws.Cells(top + 2, 1).Resize(1, 2).value = Array("Metric", "Value")
+    ws.Cells(top + 2, 1).Resize(1, 2).Font.Bold = True
+
+
+    r = top + 3
+    firstPnl = r
+
+
+    DashLabelledFormula ws, r, "Futures PnL (model)", _
+        "=" & DashSumFml("Futures_Gov_Model_PnL"), "#,##0": r = r + 1
+    DashLabelledFormula ws, r, "Plain swap PnL (model)", _
+        "=" & DashSumFml("Swap_Curve_Model_PnL"), "#,##0": r = r + 1
+    DashLabelledFormula ws, r, "Hedge PnL (model)", _
+        "=" & DashSumFml("Hedge_Curve_Model_PnL"), "#,##0": r = r + 1
+    DashLabelledFormula ws, r, "Futures PnL (actual)", _
+        "=" & DashSumFml("Actual_Futures_PnL"), "#,##0": r = r + 1
+    DashLabelledFormula ws, r, "Plain swap PnL (actual)", _
+        "=" & DashSumFml("Actual_PlainSwap_PnL"), "#,##0": r = r + 1
+    DashLabelledFormula ws, r, "Hedge basis (actual - model)", _
+        "=" & DashSumFml("Hedge_Model_Residual_PnL"), "#,##0"
+    lastPnl = r
+    r = r + 2
+
+
+    ' --- BPV block -----------------------------------------------------------
+    actualBpvRow = r
+    DashLabelledFormula ws, r, "Actual hedge BPV (plain swap + futures)", _
+        "=SUMIFS(" & DashN("Actual_Hedge_DV01") & "," & DashDetailCriteria() & ")", "#,##0": r = r + 1
+
+
+    ' Target comes from PNL_Attribution!Target_Hedge_DV01, which applies the
+    ' synthetic-first rule per row.  Summing a per-row choice is correct; picking
+    ' the rule at portfolio level would not be.
+    targetBpvRow = r
+    DashLabelledFormula ws, r, "Target hedge BPV (synthetic, else flat)", _
+        "=SUMIFS(" & DashN("Target_Hedge_DV01") & "," & DashDetailCriteria() & ")", "#,##0": r = r + 1
+
+
+    DashLabelledFormula ws, r, "Actual minus target BPV", _
+        "=B" & CStr(actualBpvRow) & "-B" & CStr(targetBpvRow), "#,##0": r = r + 1
+
+
+    ' Netted across the book, so offsetting per-bond errors cancel.  It will read
+    ' better than the per-bond distribution below - that difference is the point.
+    ' Same definition as the per-bond column, applied to the netted totals.
+    DashLabelledFormula ws, r, "Portfolio hedge efficiency (netted)", _
+        "=IF(B" & CStr(targetBpvRow) & "=0,""""," & _
+        "1-ABS(B" & CStr(actualBpvRow) & "-B" & CStr(targetBpvRow) & _
+        ")/ABS(B" & CStr(targetBpvRow) & "))", "0.00%"
+    r = r + 1
+
+
+    ' Median of the per-bond column, for contrast with the netted figure above.
+    '
+    ' AGGREGATE function 12 is MEDIAN; option 6 ignores errors and it needs no
+    ' array entry, so this stays an ordinary .Formula write.
+    '
+    ' This was AGGREGATE(17,...) with half the row count as the last argument.
+    ' Function 17 is QUARTILE.INC, whose last argument is a quartile 0-4, so any
+    ' book with more than eight rows returned #NUM! and the IFERROR displayed it
+    ' as blank - the tile looked empty rather than wrong.  Functions 1-13 take no
+    ' k argument at all.
+    DashLabelledFormula ws, r, "Median per-bond hedge efficiency", _
+        "=IFERROR(AGGREGATE(12,6," & DashN("Hedge_Efficiency") & "),"""")", "0.00%"
+
+
+    ws.Range("A" & CStr(top + 2) & ":B" & CStr(r)).Borders.LineStyle = xlContinuous
+
+
+    DashAddOrReplaceName "DashChartHedge", _
+        "'" & DASH_SH_DASH & "'!$A$" & CStr(top + 2) & ":$B$" & CStr(lastPnl)
+
+
+    dashRowCursor = r
+
+
+End Sub
+
+
+Private Sub DashLabelledFormula( _
+    ByVal ws As Worksheet, _
+    ByVal rowNum As Long, _
+    ByVal label As String, _
+    ByVal formulaText As String, _
+    ByVal numberFormat As String)
+
+
+    ws.Cells(rowNum, 1).value = label
+    ws.Cells(rowNum, 2).formula = formulaText
+    ws.Cells(rowNum, 2).numberFormat = numberFormat
+
+
+End Sub
+
+
+' =============================================================================
+' HEDGE EFFICIENCY DISTRIBUTION
+'
+' Buckets are half-open [lo, hi) throughout.  The previous version mixed "<" at
+' 0.5 and 0.75 with "<=" at 0.9, and labelled the top bucket "90% - 100%" when
+' it actually held everything above 0.9.
+'
+' Efficiency is no longer clamped at 0 upstream, so the "< 0%" bucket now really
+' does isolate wrong-way and grossly oversized hedges instead of burying them.
+' =============================================================================
+
+
+Private Sub DashBuildEfficiencyBuckets( _
+    ByVal ws As Worksheet, _
+    ByVal topRow As Long)
+
+
+    Dim top As Long
+    Dim r As Long
+    Dim firstBucket As Long
+    Dim eff As String
+
+
+    eff = DashN("Hedge_Efficiency")
+    top = topRow
+
+
+    ws.Cells(top, 1).value = "BPV Hedge Efficiency Distribution"
+    ws.Cells(top, 1).Font.Bold = True
+    ws.Cells(top, 1).Font.Size = 12
+
+
+    ws.Cells(top + 2, 1).Resize(1, 2).value = Array("Bucket", "Count")
+    ws.Cells(top + 2, 1).Resize(1, 2).Font.Bold = True
+
+
+    r = top + 3
+    firstBucket = r
+
+
+    DashBucketRow ws, r, "< 0% (wrong way / oversized)", eff, "<0", "": r = r + 1
+    DashBucketRow ws, r, "0% to 50%", eff, ">=0", "<0.5": r = r + 1
+    DashBucketRow ws, r, "50% to 75%", eff, ">=0.5", "<0.75": r = r + 1
+    DashBucketRow ws, r, "75% to 90%", eff, ">=0.75", "<0.9": r = r + 1
+    DashBucketRow ws, r, "90% and above", eff, ">=0.9", "": r = r + 1
+
+
+    ' Everything the buckets could not classify: no target BPV, or no hedge.
+    ws.Cells(r, 1).value = "Missing BPV / no target"
+    ws.Cells(r, 2).formula = _
+        "=" & DashCountDetailFml() & "-SUM(B" & CStr(firstBucket) & ":B" & CStr(r - 1) & ")"
+
+
+    ws.Range("A" & CStr(top + 2) & ":B" & CStr(r)).Borders.LineStyle = xlContinuous
+
+
+    DashAddOrReplaceName "DashChartEfficiency", _
+        "'" & DASH_SH_DASH & "'!$A$" & CStr(top + 2) & ":$B$" & CStr(r)
+
+
+    ' Shares vertical space with the two count blocks to its right, so the
+    ' cursor tracks whichever of the three ends lowest.
+    If r > dashRowCursor Then
+        dashRowCursor = r
+    End If
+
+
+End Sub
+
+
+Private Sub DashBucketRow( _
+    ByVal ws As Worksheet, _
+    ByVal rowNum As Long, _
+    ByVal label As String, _
+    ByVal effName As String, _
+    ByVal lowTest As String, _
+    ByVal highTest As String)
+
+
+    Dim f As String
+
+
+    f = "=COUNTIFS(" & DashDetailCriteria() & "," & effName & ",""" & lowTest & """"
+
+
+    If Len(highTest) > 0 Then
+        f = f & "," & effName & ",""" & highTest & """"
+    End If
+
+
+    f = f & ")"
+
+
+    ws.Cells(rowNum, 1).value = label
+    ws.Cells(rowNum, 2).formula = f
+
+
+End Sub
+
+
+' =============================================================================
+' TEXT-VALUE COUNT SUMMARIES  (attribution status, spread framework)
+'
+' VBA discovers the DISTINCT LABELS - a layout decision, since the number of
+' rows the block needs is not known until the data is read.  Each COUNT is a
+' COUNTIFS pointing back at the label cell, so the numbers stay live.
+' =============================================================================
+
+
+Private Sub DashBuildStatusSummary( _
+    ByVal ws As Worksheet, _
+    ByVal wsP As Worksheet, _
+    ByVal lastRow As Long, _
+    ByVal topRow As Long)
+
+
+    DashBuildTextCountSummary _
+        ws, wsP, lastRow, _
+        topRow, 4, _
+        "Data Quality / Attribution Status", _
+        "Status", _
+        "Attribution_Status"
+
+
+End Sub
+
+
+Private Sub DashBuildFrameworkSummary( _
+    ByVal ws As Worksheet, _
+    ByVal wsP As Worksheet, _
+    ByVal lastRow As Long, _
+    ByVal topRow As Long)
+
+
+    DashBuildTextCountSummary _
+        ws, wsP, lastRow, _
+        topRow, 7, _
+        "Credit-Spread Framework", _
+        "Framework", _
+        "Spread_Framework_Auto"
+
+
+End Sub
+
+
+Private Sub DashBuildTextCountSummary( _
+    ByVal ws As Worksheet, _
+    ByVal wsP As Worksheet, _
+    ByVal lastRow As Long, _
+    ByVal topRow As Long, _
+    ByVal outCol As Long, _
+    ByVal titleText As String, _
+    ByVal columnTitle As String, _
+    ByVal headerName As String)
+
+
+    Dim values As Object
+    Dim sourceCol As Long
+    Dim isinCol As Long
+    Dim rowNum As Long
+    Dim cellText As String
+    Dim isinText As String
+    Dim key As Variant
+    Dim outRow As Long
+    Dim labelCell As String
+
+
+    Set values = CreateObject("Scripting.Dictionary")
+
+
+    sourceCol = DashKeyCol(headerName)
+    isinCol = DashKeyCol("ISIN")
+
+
+    For rowNum = DASH_DATA_ROW To lastRow
+
+
+        isinText = UCase$(DashCleanText(wsP.Cells(rowNum, isinCol).value))
+
+
+        If Len(isinText) > 0 And isinText <> "TOTAL" Then
+
+
+            cellText = DashCleanText(wsP.Cells(rowNum, sourceCol).value)
+
+
+            If Len(cellText) > 0 Then
+                If Not values.Exists(cellText) Then
+                    values.Add cellText, 0
+                End If
+            End If
+
+
+        End If
+
+
+    Next rowNum
+
+
+    ws.Cells(topRow, outCol).value = titleText
+    ws.Cells(topRow, outCol).Font.Bold = True
+    ws.Cells(topRow, outCol).Font.Size = 12
+
+
+    ws.Cells(topRow + 2, outCol).value = columnTitle
+    ws.Cells(topRow + 2, outCol + 1).value = "Count"
+    ws.Cells(topRow + 2, outCol).Resize(1, 2).Font.Bold = True
+
+
+    outRow = topRow + 3
+
+
+    For Each key In values.Keys
+
+
+        labelCell = ws.Cells(outRow, outCol).Address(True, True)
+
+
+        ws.Cells(outRow, outCol).value = CStr(key)
+        ws.Cells(outRow, outCol + 1).formula = _
+            "=COUNTIFS(" & DashDetailCriteria() & "," & _
+            DashN(headerName) & "," & labelCell & ")"
+
+
+        outRow = outRow + 1
+
+
+    Next key
+
+
+    ' Catch-all so the block always accounts for every detail row, including any
+    ' with a blank value in this column.
+    ws.Cells(outRow, outCol).value = "(blank)"
+    ws.Cells(outRow, outCol + 1).formula = _
+        "=" & DashCountDetailFml() & "-SUM(" & _
+        ws.Cells(topRow + 3, outCol + 1).Address(True, True) & ":" & _
+        ws.Cells(outRow - 1, outCol + 1).Address(True, True) & ")"
+
+
+    ws.Range(ws.Cells(topRow + 2, outCol), ws.Cells(outRow, outCol + 1)).Borders.LineStyle = xlContinuous
+
+
+    ' Each of these blocks sits in its own columns but they share the vertical
+    ' space, so the cursor tracks the TALLEST of them.
+    If outRow > dashRowCursor Then
+        dashRowCursor = outRow
+    End If
+
+
+End Sub
+
+
+' =============================================================================
+' HIDDEN RANKING STAGE
+'
+' The Top-N tables need to rank by |metric|.  Doing that with LARGE(ABS(range))
+' would be an array formula, which .Formula cannot write safely.  Instead each
+' ranked table gets one hidden staging column holding, per source row, the
+' absolute metric with a tiny row-dependent decrement:
+'
+'     key(n) = ABS(metric(n)) - n * 1E-9
+'
+' The decrement makes every key unique, so MATCH() on a LARGE() value resolves
+' to exactly one row.  Without it two bonds with an identical metric would both
+' resolve to the first of them and the second would be lost from the table.
+'
+' Rows with no numeric metric get a large negative sentinel so they can never
+' win a LARGE(), rather than being dropped and shifting the ranking.
+'
+' The whole stage is plain per-row formulas, so the tables stay live: change a
+' number in PNL_Attribution and the ranking re-sorts itself.
+' =============================================================================
+
+
+Private Sub DashBuildRankStage( _
+    ByVal ws As Worksheet, _
+    ByVal lastRow As Long)
+
+
+    Dim metrics As Variant
+    Dim i As Long
+    Dim n As Long
+    Dim rowCount As Long
+    Dim col As Long
+    Dim f As String
+
+
+    ' One column per ranked table, in the order the tables are built.
+    metrics = Array( _
+        "Unexplained_Residual_PnL", _
+        "PnL_FX", _
+        "Hedge_Curve_Model_PnL", _
+        "SpreadPnL_Used")
+
+
+    rowCount = lastRow - DASH_DATA_ROW + 1
+
+
+    For i = LBound(metrics) To UBound(metrics)
+
+
+        col = DASH_STAGE_FIRST_COL + i
+
+
+        ws.Cells(DASH_DATA_ROW - 1, col).value = _
+            "rank key: " & CStr(metrics(i))
+
+
+        For n = 1 To rowCount
+
+
+            ' Row_Valid gates the rank key as well as the totals.  A Top 10
+            ' Residuals table headed by bonds that were excluded from the
+            ' book total is worse than useless - it points the reader at
+            ' numbers that are not in any of the figures above it.  The
+            ' quarantine block at the bottom is where those belong.
+            f = "=IF(AND(ISNUMBER(INDEX(" & DashN(CStr(metrics(i))) & "," & CStr(n) & "))," & _
+                "INDEX(" & DashN("Row_Valid") & "," & CStr(n) & ")=1)," & _
+                "ABS(INDEX(" & DashN(CStr(metrics(i))) & "," & CStr(n) & "))-" & _
+                CStr(n) & "*0.000000001," & DASH_RANK_FLOOR & ")"
+
+
+            ws.Cells(DASH_DATA_ROW - 1 + n, col).formula = f
+
+
+        Next n
+
+
+        DashAddOrReplaceName _
+            "DashRankKey" & CStr(i + 1), _
+            "'" & DASH_SH_DASH & "'!" & _
+            ws.Range(ws.Cells(DASH_DATA_ROW, col), ws.Cells(DASH_DATA_ROW - 1 + rowCount, col)).Address(True, True)
+
+
+    Next i
+
+
+    ws.Range( _
+        ws.Cells(1, DASH_STAGE_FIRST_COL), _
+        ws.Cells(1, DASH_STAGE_FIRST_COL + DASH_STAGE_COLS - 1)).EntireColumn.Hidden = True
+
+
+End Sub
+
+
+' =============================================================================
+' TOP-N TABLES
+'
+' Every cell is a formula.  VBA chooses only where the table sits and which
+' metric it ranks; Excel decides which bonds appear and what they show, so the
+' table re-ranks itself when the source changes.
+' =============================================================================
+
+
+Private Sub DashBuildTopTable( _
+    ByVal ws As Worksheet, _
+    ByVal startRow As Long, _
+    ByVal startCol As Long, _
+    ByVal rankKeyIndex As Long, _
+    ByVal titleText As String, _
+    ByVal metricHeader As String)
+
+
+    Dim i As Long
+    Dim r As Long
+    Dim keyName As String
+    Dim posExpr As String
+
+
+    keyName = "DashRankKey" & CStr(rankKeyIndex)
+
+
+    ws.Cells(startRow, startCol).value = titleText
+    ws.Cells(startRow, startCol).Font.Bold = True
+    ws.Cells(startRow, startCol).Font.Size = 12
+
+
+    ws.Cells(startRow + 2, startCol).Resize(1, 9).value = Array( _
+        "Metric", "ISIN", "Name", "CCY", "Portfolio", _
+        "Actual", "Explained", "Residual", "Status")
+
+
+    ws.Cells(startRow + 2, startCol).Resize(1, 9).Font.Bold = True
+
+
+    For i = 1 To DASH_TOP_N
+
+
+        r = startRow + 2 + i
+
+
+        ' Position of the i-th largest key within the source range.  Computed
+        ' once per row and reused by every column via that column's INDEX.
+        posExpr = "MATCH(LARGE(" & keyName & "," & CStr(i) & ")," & keyName & ",0)"
+
+
+        ws.Cells(r, startCol + 0).formula = _
+            DashTopCell(posExpr, DashN(metricHeader), keyName, i)
+        ws.Cells(r, startCol + 1).formula = _
+            DashTopCell(posExpr, DashN("ISIN"), keyName, i)
+        ws.Cells(r, startCol + 2).formula = _
+            DashTopCell(posExpr, DashN("Name"), keyName, i)
+        ws.Cells(r, startCol + 3).formula = _
+            DashTopCell(posExpr, DashN("CCY"), keyName, i)
+        ws.Cells(r, startCol + 4).formula = _
+            DashTopCell(posExpr, DashN("Portfolio"), keyName, i)
+        ws.Cells(r, startCol + 5).formula = _
+            DashTopCell(posExpr, DashN("Official_Total_PnL"), keyName, i)
+        ws.Cells(r, startCol + 6).formula = _
+            DashTopCell(posExpr, DashN("Total_Model_Explained"), keyName, i)
+        ws.Cells(r, startCol + 7).formula = _
+            DashTopCell(posExpr, DashN("Unexplained_Residual_PnL"), keyName, i)
+        ws.Cells(r, startCol + 8).formula = _
+            DashTopCell(posExpr, DashN("Attribution_Status"), keyName, i)
+
+
+    Next i
+
+
+    ws.Range( _
+        ws.Cells(startRow + 3, startCol), _
+        ws.Cells(startRow + 2 + DASH_TOP_N, startCol)).numberFormat = "#,##0"
+
+
+    ws.Range( _
+        ws.Cells(startRow + 3, startCol + 5), _
+        ws.Cells(startRow + 2 + DASH_TOP_N, startCol + 7)).numberFormat = "#,##0"
+
+
+    ws.Range( _
+        ws.Cells(startRow + 2, startCol), _
+        ws.Cells(startRow + 2 + DASH_TOP_N, startCol + 8)).Borders.LineStyle = xlContinuous
+
+
+End Sub
+
+
+' One ranked cell.  Blank - not #N/A and not a misleading 0 - when there is no
+' i-th ranked row, so a short book or a sparse metric produces a short table
+' rather than a table full of errors.
+'
+' Two ways there can be no i-th row, and both must be caught:
+'   - fewer source rows than i, which makes LARGE() error   -> IFERROR
+'   - the i-th key is the sentinel, i.e. that row had no numeric metric, so it
+'     is padding rather than a real ranking position        -> the sentinel test
+' The key column is never blank (non-numeric rows get the sentinel), so COUNT()
+' on it would always equal the row count and could not distinguish these.
+Private Function DashTopCell( _
+    ByVal posExpr As String, _
+    ByVal valueName As String, _
+    ByVal keyName As String, _
+    ByVal rankIndex As Long) As String
+
+
+    DashTopCell = _
+        "=IFERROR(IF(LARGE(" & keyName & "," & CStr(rankIndex) & ")<-1E+300,""""," & _
+        "INDEX(" & valueName & "," & posExpr & ")),"""")"
+
+
+End Function
+
+
+' =============================================================================
+' BPV HEDGE-EFFICIENCY DETAIL
+'
+' One formula row per source row.  Hedge efficiency and the target BPV are READ
+' from PNL_Attribution, not recomputed - this module used to apply its own
+' definition of both, so the same bond could score differently depending on
+' which sheet you were looking at.
+'
+' The TOTAL row is =SUM() over the block, so it can never disagree with the rows
+' above it.
+' =============================================================================
+
+
+Private Sub DashBuildHedgeEfficiencyDetail( _
+    ByVal ws As Worksheet, _
+    ByVal lastRow As Long, _
+    ByVal startRow As Long)
+
+
+    Dim rowCount As Long
+    Dim headerRow As Long
+    Dim firstDataRow As Long
+    Dim lastDataRow As Long
+    Dim totalRow As Long
+    Dim n As Long
+    Dim r As Long
+
+
+    rowCount = lastRow - DASH_DATA_ROW + 1
+
+
+    ws.Cells(startRow, 1).value = "Hedge Efficiency / BPV Drift"
+    ws.Cells(startRow, 1).Font.Bold = True
+    ws.Cells(startRow, 1).Font.Size = 12
+
+
+    headerRow = startRow + 2
+
+
+    ws.Cells(headerRow, 1).Resize(1, 12).value = Array( _
+        "ISIN", "Name", _
+        "Bond BPV", "Plain Swap BPV", "Futures BPV", "Actual Hedge BPV", _
+        "Synthetic BPV", "Target BPV Used", "Residual BPV", _
+        "Actual minus Target", "Hedge Efficiency", "Status")
+
+
+    ws.Cells(headerRow, 1).Resize(1, 12).Font.Bold = True
+
+
+    firstDataRow = headerRow + 1
+
+
+    For n = 1 To rowCount
+
+
+        r = firstDataRow + n - 1
+
+
+        ws.Cells(r, 1).formula = DashIndexCell("ISIN", n)
+        ws.Cells(r, 2).formula = DashIndexCell("Name", n)
+        ws.Cells(r, 3).formula = DashIndexCell("Bond_DV01_Current", n)
+        ws.Cells(r, 4).formula = DashIndexCell("PlainSwap_DV01", n)
+        ws.Cells(r, 5).formula = "=" & DashFutDv01Index(n)
+        ws.Cells(r, 6).formula = DashIndexCell("Actual_Hedge_DV01", n)
+        ws.Cells(r, 7).formula = DashIndexCell("SyntheticSwap_DV01", n)
+        ws.Cells(r, 8).formula = DashIndexCell("Target_Hedge_DV01", n)
+        ws.Cells(r, 9).formula = DashIndexCell("Residual_DV01", n)
+
+
+        ws.Cells(r, 10).formula = _
+            "=IF(OR(NOT(ISNUMBER(F" & CStr(r) & ")),NOT(ISNUMBER(H" & CStr(r) & ")))," & _
+            """"",F" & CStr(r) & "-H" & CStr(r) & ")"
+
+
+        ws.Cells(r, 11).formula = DashIndexCell("Hedge_Efficiency", n)
+        ws.Cells(r, 12).formula = DashIndexCell("Attribution_Status", n)
+
+
+    Next n
+
+
+    lastDataRow = firstDataRow + rowCount - 1
+    totalRow = lastDataRow + 1
+
+
+    ws.Cells(totalRow, 1).value = "TOTAL"
+    ws.Cells(totalRow, 1).Font.Bold = True
+
+
+    For n = 3 To 10
+        ws.Cells(totalRow, n).formula = _
+            "=SUM(" & DashColLetter(n) & CStr(firstDataRow) & _
+            ":" & DashColLetter(n) & CStr(lastDataRow) & ")"
+    Next n
+
+
+    ' Portfolio efficiency on the netted totals, same definition as per bond.
+    ws.Cells(totalRow, 11).formula = _
+        "=IF(H" & CStr(totalRow) & "=0,""""," & _
+        "1-ABS(F" & CStr(totalRow) & "-H" & CStr(totalRow) & _
+        ")/ABS(H" & CStr(totalRow) & "))"
+
+
+    ws.Cells(totalRow, 12).value = "netted across book"
+
+
+    ws.Cells(totalRow, 1).Resize(1, 12).Font.Bold = True
+
+
+    ws.Range("C" & CStr(firstDataRow) & ":J" & CStr(totalRow)).numberFormat = "#,##0"
+    ws.Range("K" & CStr(firstDataRow) & ":K" & CStr(totalRow)).numberFormat = "0.00%"
+
+
+    ws.Range("A" & CStr(headerRow) & ":L" & CStr(totalRow)).Borders.LineStyle = xlContinuous
+
+
+    dashRowCursor = totalRow
+
+
+End Sub
+
+
+' Live link to the n-th detail row of one PNL_Attribution column.
+Private Function DashIndexCell( _
+    ByVal headerName As String, _
+    ByVal n As Long) As String
+
+
+    DashIndexCell = _
+        "=IFERROR(INDEX(" & DashN(headerName) & "," & CStr(n) & "),"""")"
+
+
+End Function
+
+
+' =============================================================================
+' RISK BY FACTOR
+'
+' What the book is exposed to, what stands against it, and what is left.
+'
+' The Bond / Asset BPV column used to be the literal string "0" on every factor
+' row.  So Net BPV was just the hedge BPV, and the Control column - which asks
+' whether the net is small next to the two sides - compared a hedge against
+' itself and answered REVIEW on every row that had any hedge at all.  The table
+' looked like a book in permanent crisis and told the reader nothing.
+'
+' A bond is exposed to every factor at once: y = r + g + q + i, so the same
+' DV01 sits behind all of them.  What can be split is not the exposure but the
+' HEDGE, and with it the share of the bond's BPV each hedge stands against:
+'
+'   coverage  = min(1, |hedge| / |bond|)      how much of the bond is hedged
+'   share_f   = |futures| / |hedge|           how that cover splits
+'   share_s   = |swaps|   / |hedge|
+'
+'   futures row   bond BPV = bond x coverage x share_f
+'   swaps row     bond BPV = bond x coverage x share_s
+'   unhedged row  bond BPV = bond x (1 - coverage)
+'
+' The three add back to the whole book's BPV exactly, and their hedge column
+' adds back to Actual_Hedge_DV01, so the Total line is a genuine check on the
+' three above it rather than a fourth independent number.
+'
+' A well-hedged bucket nets to ~0.  An over-hedged one nets negative, which is
+' the honest answer - the cover exceeds the risk.  The unhedged row nets to the
+' risk itself and carries no control, because unhedged risk is a position, not
+' an error.
+' =============================================================================
+
+Private Sub DashBuildRiskFactorView(ByVal ws As Worksheet, ByVal startRow As Long)
+
+    Dim r As Long
+    Dim swLast As Long
+    Dim sw As String
+    Dim firstRow As Long
+    Dim totalRow As Long
+
+    swLast = DashHedgeLastRow(DASH_SH_SWAPS, DASH_SWAP_KEY_COL)
+    sw = "'" & DASH_SH_SWAPS & "'!"
+
+    ws.Cells(startRow, 1).value = "Risk by Factor | What Stands Against What"
+    ws.Cells(startRow, 1).Font.Bold = True
+    ws.Cells(startRow, 1).Font.Size = 12
+
+    ws.Cells(startRow + 2, 1).Resize(1, 6).value = Array( _
+        "Factor", "Bond BPV", "Hedge BPV", "Net BPV", "PnL EUR", "Control")
+    ws.Cells(startRow + 2, 1).Resize(1, 6).Font.Bold = True
+
+    r = startRow + 3
+    firstRow = r
+
+    DashRiskRow ws, r, "Government curve | bond futures", _
+        DashRiskAllocExpr("FUT"), _
+        "SUMIFS(" & DashN("FuturesRTJ_DV01") & "," & DashDetailCriteria() & ")" & _
+        "+SUMIFS(" & DashN("FuturesRT_DV01") & "," & DashDetailCriteria() & ")", _
+        DashSumFml("Futures_Gov_Model_PnL"), True
+    r = r + 1
+
+    DashRiskRow ws, r, "Swap curve | interest-rate swaps", _
+        DashRiskAllocExpr("SWAP"), _
+        "SUMIFS(" & DashN("PlainSwap_DV01") & "," & DashDetailCriteria() & ")", _
+        DashSumFml("Swap_Curve_Model_PnL"), True
+    r = r + 1
+
+    DashRiskRow ws, r, "Unhedged", _
+        DashRiskAllocExpr("OPEN"), "0", """""", False
+    r = r + 1
+
+    totalRow = r
+    DashRiskRow ws, r, "Total parallel BPV", _
+        "SUMIFS(" & DashN("Bond_DV01_Current") & "," & DashDetailCriteria() & ")", _
+        "SUMIFS(" & DashN("Actual_Hedge_DV01") & "," & DashDetailCriteria() & ")", _
+        DashSumFml("PnL_Duration_Total"), True
+    ws.Cells(r, 1).Resize(1, 6).Font.Bold = True
+    r = r + 1
+
+    ' Proof that the split above is a split: the three buckets must add to the
+    ' total, on both sides.  A non-zero here means the allocation and the
+    ' totals are reading different books.
+    ws.Cells(r, 1).value = "Check: buckets less total (want 0)"
+    ws.Cells(r, 1).Font.Italic = True
+    ws.Cells(r, 2).formula = _
+        "=SUM(B" & CStr(firstRow) & ":B" & CStr(totalRow - 1) & _
+        ")-B" & CStr(totalRow)
+    ws.Cells(r, 3).formula = _
+        "=SUM(C" & CStr(firstRow) & ":C" & CStr(totalRow - 1) & _
+        ")-C" & CStr(totalRow)
+    ws.Range(ws.Cells(r, 2), ws.Cells(r, 3)).numberFormat = "#,##0.00"
+    r = r + 2
+
+    ' The swap hedge, by float index.  A MEMO, and separated from the table
+    ' above on purpose: it is taken off the Swaps sheet in full, including the
+    ' swaps of bonds the attribution quarantined, so it does not tie to the
+    ' swap-curve line and must not look as though it should.
+    ws.Cells(r, 1).value = "Swap hedge by float index (inventory, from " & _
+                           DASH_SH_SWAPS & " - not filtered)"
+    ws.Cells(r, 1).Font.Bold = True
+    r = r + 1
+
+    ws.Cells(r, 1).value = "EURIBOR"
+    ws.Cells(r, 3).formula = "=" & DashSwapFamilySumExpr(sw, swLast, "EURIBOR")
+    r = r + 1
+    ws.Cells(r, 1).value = "ESTR"
+    ws.Cells(r, 3).formula = "=" & DashSwapFamilySumExpr(sw, swLast, "ESTR")
+    r = r + 1
+    ws.Cells(r, 1).value = "SOFR"
+    ws.Cells(r, 3).formula = "=" & DashSwapFamilySumExpr(sw, swLast, "SOFR")
+    r = r + 1
+    ws.Cells(r, 1).value = "Unknown float index"
+    ws.Cells(r, 3).formula = "=" & DashSwapFamilySumExpr(sw, swLast, "UNKNOWN")
+
+    ws.Range(ws.Cells(startRow + 2, 1), ws.Cells(r, 6)).Borders.LineStyle = xlContinuous
+    ws.Range(ws.Cells(startRow + 3, 2), ws.Cells(r, 5)).numberFormat = "#,##0"
+
+    dashRowCursor = r
+
+End Sub
+
+
+' The bond BPV standing behind one hedge bucket, over the rows in the totals.
+'
+' part = "FUT"  the share of the book's BPV the futures hedge covers
+'        "SWAP" the share the swap hedge covers
+'        "OPEN" what neither covers
+'
+' Written as one LET so the intermediate arrays are named rather than repeated
+' four times each, and so the three expressions are visibly the same
+' calculation with a different last line.
+Private Function DashRiskAllocExpr(ByVal part As String) As String
+
+    Dim s As String
+
+    ' LET names carry a leading underscore, as everywhere else in this workbook,
+    ' so they cannot collide with an Excel function name - a variable called "n"
+    ' would shadow N().
+    s = "LET(" & _
+        "_m," & DashValidMask() & "," & _
+        "_b,N(" & DashN("Bond_DV01_Current") & ")," & _
+        "_f,ABS(N(" & DashN("FuturesRTJ_DV01") & ")+N(" & DashN("FuturesRT_DV01") & "))," & _
+        "_s,ABS(N(" & DashN("PlainSwap_DV01") & "))," & _
+        "_h,_f+_s," & _
+        "_cov,IF(ABS(_b)=0,0,IF(_h>ABS(_b),1,_h/ABS(_b)))," & _
+        "_shf,IF(_h=0,0,_f/_h),"
+
+    Select Case UCase$(part)
+        Case "FUT"
+            s = s & "SUMPRODUCT(_m*_b*_cov*_shf))"
+        Case "SWAP"
+            s = s & "SUMPRODUCT(_m*_b*_cov*(1-_shf)))"
+        Case Else
+            s = s & "SUMPRODUCT(_m*_b*(1-_cov)))"
+    End Select
+
+    DashRiskAllocExpr = s
+
+End Function
+
+
+Private Function DashSwapFamilySumExpr(ByVal sw As String, ByVal swLast As Long, ByVal family As String) As String
+    ' Swaps!X is the model annuity DV01 the workbook no longer feeds anything
+    ' from; PNL_Attribution reads Swaps!BN (SW_CNV_BPV, Bloomberg).  Summing X
+    ' here put a different number in the Hedge BPV column of the risk view than
+    ' the one every other table on this sheet uses.
+    DashSwapFamilySumExpr = "SUMIFS(" & _
+        sw & "$" & DASH_SWAP_DV01_COL & "$5:$" & DASH_SWAP_DV01_COL & "$" & CStr(swLast) & "," & _
+        sw & "$" & DASH_SWAP_SOURCE_COL & "$5:$" & DASH_SWAP_SOURCE_COL & "$" & CStr(swLast) & ",""PLAIN""," & _
+        sw & "$" & DASH_SWAP_FAMILY_COL & "$5:$" & DASH_SWAP_FAMILY_COL & "$" & CStr(swLast) & ",""" & family & """)"
+End Function
+
+' One line of the risk table.
+'
+' checkNet asks whether the net is meant to be small.  It is for a hedged
+' bucket - that is what hedged means - and it is not for the unhedged line,
+' whose net IS the open risk and would otherwise be reported as a fault on
+' every book that carries any.
+Private Sub DashRiskRow( _
+    ByVal ws As Worksheet, _
+    ByVal r As Long, _
+    ByVal label As String, _
+    ByVal assetExpr As String, _
+    ByVal hedgeExpr As String, _
+    ByVal pnlExpr As String, _
+    ByVal checkNet As Boolean)
+
+    ws.Cells(r, 1).value = label
+    ws.Cells(r, 2).formula = "=" & assetExpr
+    ws.Cells(r, 3).formula = "=" & hedgeExpr
+    ws.Cells(r, 4).formula = "=IF(AND(ISNUMBER(B" & r & "),ISNUMBER(C" & r & ")),B" & r & "+C" & r & ","""")"
+    ws.Cells(r, 5).formula = "=" & pnlExpr
+
+    If checkNet Then
+        ws.Cells(r, 6).formula = _
+            "=IF(NOT(ISNUMBER(D" & r & ")),""""," & _
+            "IF(ABS(D" & r & ")<=MAX(1,0.02*MAX(ABS(B" & r & "),ABS(C" & r & ")))," & _
+            """OK"",""REVIEW""))"
+    Else
+        ws.Cells(r, 6).value = "open risk"
+    End If
+
+End Sub
+
+Private Sub DashBuildSharedFrameworkView(ByVal ws As Worksheet, ByVal lastRow As Long, ByVal startRow As Long)
+    Dim n As Long, r As Long, rowCount As Long, swLast As Long
+    Dim sw As String
+    rowCount = lastRow - DASH_DATA_ROW + 1
+    swLast = DashHedgeLastRow(DASH_SH_SWAPS, DASH_SWAP_KEY_COL)
+    sw = "'" & DASH_SH_SWAPS & "'!"
+    ws.Cells(startRow, 1).value = "Shared Spread Framework Validation"
+    ws.Cells(startRow, 1).Font.Bold = True
+    ws.Cells(startRow, 1).Font.Size = 12
+    ws.Cells(startRow + 2, 1).Resize(1, 16).value = Array("ISIN", "Name", "Framework Used", "Bond BPV", "Futures BPV", "EURIBOR BPV", "ESTR BPV", "SOFR BPV", "Unknown BPV", "Gov Wt", "EURIBOR Wt", "OIS Wt", "Unhedged Wt", "Raw Coverage", "Framework Check", "Reason")
+    ws.Cells(startRow + 2, 1).Resize(1, 16).Font.Bold = True
+    For n = 1 To rowCount
+        r = startRow + 2 + n
+        ws.Cells(r, 1).formula = DashIndexCell("ISIN", n)
+        ws.Cells(r, 2).formula = DashIndexCell("Name", n)
+        ws.Cells(r, 3).formula = DashIndexCell("Spread_Framework_Auto", n)
+        ws.Cells(r, 4).formula = "=ABS(IFERROR(INDEX(" & DashN("Bond_DV01_Current") & "," & n & "),0))"
+        ws.Cells(r, 5).formula = "=ABS" & DashFutDv01Index(n)
+        ws.Cells(r, 6).formula = DashSwapFamilyByIsinFml(sw, swLast, r, "EURIBOR")
+        ws.Cells(r, 7).formula = DashSwapFamilyByIsinFml(sw, swLast, r, "ESTR")
+        ws.Cells(r, 8).formula = DashSwapFamilyByIsinFml(sw, swLast, r, "SOFR")
+        ws.Cells(r, 9).formula = DashSwapFamilyByIsinFml(sw, swLast, r, "UNKNOWN")
+        ws.Cells(r, 10).formula = DashFrameworkWeightFml(r, "E")
+        ws.Cells(r, 11).formula = DashFrameworkWeightFml(r, "F")
+        ws.Cells(r, 12).formula = DashFrameworkWeightFml(r, "G+H")
+        ws.Cells(r, 13).formula = "=IF(D" & r & "=0,"""",MAX(D" & r & "-E" & r & "-F" & r & "-G" & r & "-H" & r & ",0)/D" & r & ")"
+        ws.Cells(r, 14).formula = "=IF(D" & r & "=0,"""",(E" & r & "+F" & r & "+G" & r & "+H" & r & ")/D" & r & ")"
+        ws.Cells(r, 15).formula = "=IF(A" & r & "="""","""",IF(I" & r & ">0,""REVIEW: unknown swap family"",IF(ABS(SUM(J" & r & ":M" & r & ")-1)>0.000001,""REVIEW: weights"",IF(C" & r & "=""REVIEW"",""REVIEW: PnL framework"",""OK""))))"
+        ws.Cells(r, 16).formula = DashIndexCell("Spread_Framework_Reason", n)
+    Next n
+    r = startRow + 2 + rowCount
+    ws.Range(ws.Cells(startRow + 3, 4), ws.Cells(r, 9)).numberFormat = "#,##0"
+    ws.Range(ws.Cells(startRow + 3, 10), ws.Cells(r, 14)).numberFormat = "0.00%"
+    ws.Range(ws.Cells(startRow + 2, 1), ws.Cells(r, 16)).Borders.LineStyle = xlContinuous
+    dashRowCursor = r
+End Sub
+
+Private Function DashSwapFamilyByIsinFml(ByVal sw As String, ByVal swLast As Long, ByVal dashRow As Long, ByVal family As String) As String
+    DashSwapFamilyByIsinFml = "=ABS(SUMIFS(" & _
+        sw & "$" & DASH_SWAP_DV01_COL & "$5:$" & DASH_SWAP_DV01_COL & "$" & CStr(swLast) & "," & _
+        sw & "$" & DASH_SWAP_LINK_COL & "$5:$" & DASH_SWAP_LINK_COL & "$" & CStr(swLast) & ",$A" & CStr(dashRow) & "," & _
+        sw & "$" & DASH_SWAP_SOURCE_COL & "$5:$" & DASH_SWAP_SOURCE_COL & "$" & CStr(swLast) & ",""PLAIN""," & _
+        sw & "$" & DASH_SWAP_FAMILY_COL & "$5:$" & DASH_SWAP_FAMILY_COL & "$" & CStr(swLast) & ",""" & family & """))"
+End Function
+
+' Capped share of a bond's BPV attributable to one hedge bucket.
+'
+' Every reference has to carry its ROW.  This used to interpolate the caller's
+' bare column letters - "E", "F", "G+H" - straight into the formula, so it
+' emitted  MIN(E,MAX(D12-(SUM(E12:H12)-(E)),0))/D12.  A bare "E" is not a
+' reference: Excel reads it as an undefined NAME, so all three weight columns
+' evaluated to #NAME?, and the Framework Check beside them summed those errors
+' and failed too.  The whole Shared Spread Framework Validation table was
+' unreadable, which is a large part of why the framework looked wrong on this
+' sheet while PNL_Attribution had resolved it correctly.
+'
+' The row is applied here rather than at the call sites so the function cannot
+' be called wrongly again.
+Private Function DashFrameworkWeightFml(ByVal r As Long, ByVal bucketCols As String) As String
+    Dim parts() As String
+    Dim i As Long
+    Dim bucket As String
+
+
+    parts = Split(bucketCols, "+")
+
+
+    For i = LBound(parts) To UBound(parts)
+        If i > LBound(parts) Then bucket = bucket & "+"
+        bucket = bucket & Trim$(parts(i)) & CStr(r)
+    Next i
+
+
+    DashFrameworkWeightFml = "=IF(D" & r & "=0,""""," & _
+        "MIN(" & bucket & ",MAX(D" & r & "-(SUM(E" & r & ":H" & r & ")-(" & bucket & ")),0))/D" & r & ")"
+End Function
+
+Private Sub DashBuildHedgeDriftView(ByVal ws As Worksheet, ByVal lastRow As Long, ByVal startRow As Long)
+    Dim n As Long, r As Long, rowCount As Long
+    rowCount = lastRow - DASH_DATA_ROW + 1
+    ws.Cells(startRow, 1).value = "Hedge Efficiency and BPV Drift"
+    ws.Cells(startRow, 1).Font.Bold = True
+    ws.Cells(startRow, 1).Font.Size = 12
+    ' The three "drift" columns here - Initial Bond BPV, Bond BPV Drift and
+    ' Timing Bias PnL - came from Bond_DV01_Initial_Approx and
+    ' Bond_DV01_Change_Approx, which have been removed from PNL_Attribution.
+    ' They re-derived the OPENING bond risk from Bonds!DirtyMV_T-1 and a
+    ' duration: a weaker second copy of a figure Bonds already carries, and one
+    ' that disagreed with it whenever the two durations differed.
+    '
+    ' What is left is the question the table is actually for - is the hedge the
+    ' size it should be - answered from columns the model maintains.  The gap is
+    ' now READ from Hedge_DV01_Gap rather than recomputed here, so this sheet
+    ' cannot disagree with the attribution about it.
+    ws.Cells(startRow + 2, 1).Resize(1, 10).value = Array("ISIN", "Name", "Bond BPV", "Actual Hedge BPV", "Futures BPV", "Swap BPV", "Target BPV", "Hedge Gap", "Efficiency", "Drift Status")
+    ws.Cells(startRow + 2, 1).Resize(1, 10).Font.Bold = True
+    For n = 1 To rowCount
+        r = startRow + 2 + n
+        ws.Cells(r, 1).formula = DashIndexCell("ISIN", n)
+        ws.Cells(r, 2).formula = DashIndexCell("Name", n)
+        ws.Cells(r, 3).formula = DashIndexCell("Bond_DV01_Current", n)
+        ws.Cells(r, 4).formula = DashIndexCell("Actual_Hedge_DV01", n)
+        ws.Cells(r, 5).formula = "=" & DashFutDv01Index(n)
+        ws.Cells(r, 6).formula = DashIndexCell("PlainSwap_DV01", n)
+        ws.Cells(r, 7).formula = DashIndexCell("Target_Hedge_DV01", n)
+        ws.Cells(r, 8).formula = DashIndexCell("Hedge_DV01_Gap", n)
+        ws.Cells(r, 9).formula = DashIndexCell("Hedge_Efficiency", n)
+        ws.Cells(r, 10).formula = "=IF(A" & r & "="""","""",IF(ABS(H" & r & ")>MAX(1,0.02*ABS(G" & r & ")),""REVIEW"",""OK""))"
+    Next n
+    r = startRow + 2 + rowCount
+    ws.Range(ws.Cells(startRow + 3, 3), ws.Cells(r, 8)).numberFormat = "#,##0"
+    ws.Range(ws.Cells(startRow + 3, 9), ws.Cells(r, 9)).numberFormat = "0.00%"
+    ws.Range(ws.Cells(startRow + 2, 1), ws.Cells(r, 10)).Borders.LineStyle = xlContinuous
+    dashRowCursor = r
+End Sub
+
+Private Sub DashBuildErrorLocator(ByVal ws As Worksheet, ByVal lastRow As Long, ByVal startRow As Long)
+    Dim n As Long, r As Long, rowCount As Long
+    rowCount = lastRow - DASH_DATA_ROW + 1
+    ws.Cells(startRow, 1).value = "Exact Error Locator"
+    ws.Cells(startRow, 1).Font.Bold = True
+    ws.Cells(startRow, 1).Font.Size = 12
+    ws.Cells(startRow + 2, 1).Resize(1, 11).value = Array( _
+        "ISIN", "Name", "In Totals", "Primary Status", "Framework", _
+        "Framework Reason", "Duration Check", "Residual PnL", "Hedge Gap", _
+        "Efficiency", "Exact Diagnostic")
+    ws.Cells(startRow + 2, 1).Resize(1, 11).Font.Bold = True
+    For n = 1 To rowCount
+        r = startRow + 2 + n
+        ws.Cells(r, 1).formula = DashIndexCell("ISIN", n)
+        ws.Cells(r, 2).formula = DashIndexCell("Name", n)
+        ' This view lists EVERY row, the quarantined ones included - it is the
+        ' place a reader comes to find out why a bond was dropped, so hiding
+        ' the dropped ones would defeat its whole purpose.  Column C is what
+        ' says which of them are inside the totals above.
+        ws.Cells(r, 3).formula = "=IF(A" & r & "="""","""",IF(IFERROR(INDEX(" & _
+            DashN("Row_Valid") & "," & n & "),0)=1,""YES"",""NO - ""&IFERROR(INDEX(" & _
+            DashN("Row_Exclusion_Reason") & "," & n & "),"""")))"
+        ws.Cells(r, 4).formula = DashIndexCell("Attribution_Status", n)
+        ws.Cells(r, 5).formula = DashIndexCell("Spread_Framework_Auto", n)
+        ws.Cells(r, 6).formula = DashIndexCell("Spread_Framework_Reason", n)
+        ws.Cells(r, 7).formula = DashIndexCell("Duration_Identity_Check", n)
+        ws.Cells(r, 8).formula = DashIndexCell("Unexplained_Residual_PnL", n)
+        ws.Cells(r, 9).formula = "=IF(AND(ISNUMBER(INDEX(" & DashN("Actual_Hedge_DV01") & "," & n & ")),ISNUMBER(INDEX(" & DashN("Target_Hedge_DV01") & "," & n & "))),INDEX(" & DashN("Actual_Hedge_DV01") & "," & n & ")-INDEX(" & DashN("Target_Hedge_DV01") & "," & n & "),"""")"
+        ws.Cells(r, 10).formula = DashIndexCell("Hedge_Efficiency", n)
+        ws.Cells(r, 11).formula = "=IF(A" & r & "="""","""",IF(LEFT(C" & r & ",2)=""NO"",""ROW-001 | ""&C" & r & ",IF(E" & r & "=""REVIEW"",""FWK-001 | ""&F" & r & ",IF(ABS(G" & r & ")>MAX(1,0.01*ABS(INDEX(" & DashN("PnL_Duration_Total") & "," & n & "))),""REC-001 | Duration chain break"",IF(ABS(I" & r & ")>MAX(1,0.02*ABS(INDEX(" & DashN("Target_Hedge_DV01") & "," & n & "))),""HED-001 | Hedge BPV gap"",IF(D" & r & "<>""OK"",D" & r & ",IF(ABS(H" & r & ")>MAX(100,0.05*ABS(INDEX(" & DashN("Official_Total_PnL") & "," & n & "))),""PNL-001 | Material residual"",""OK"")))))))"
+    Next n
+    r = startRow + 2 + rowCount
+    ws.Range(ws.Cells(startRow + 3, 7), ws.Cells(r, 9)).numberFormat = "#,##0.00"
+    ws.Range(ws.Cells(startRow + 3, 10), ws.Cells(r, 10)).numberFormat = "0.00%"
+    ws.Range(ws.Cells(startRow + 2, 1), ws.Cells(r, 11)).Borders.LineStyle = xlContinuous
+    dashRowCursor = r
+End Sub
+
+' =============================================================================
+' EUR/USD HEDGE
+'
+' The book is EUR/USD hedged, so its currency PnL arrives in two places that
+' have to be read together: the translation of the non-EUR bond positions back
+' into EUR, and the PnL of the EUR/USD contracts held for no other purpose than
+' to cancel it.  Neither number means anything alone.  A large FX line on the
+' bond side is not a currency call the desk took; it is the half of a hedge
+' whose other half is sitting on the Futures sheet.
+'
+' What this block reports is therefore the PAIR and the RESIDUAL:
+'
+'   exposure   the opening EUR value of the non-EUR positions - the amount
+'              there is to hedge
+'   cover      the notional standing in the EUR/USD contracts against it
+'   the two    PnL legs: translation on the bonds, and PnL on those contracts
+'   residual   their sum, which is what the hedge actually cost or earned
+'
+' On a perfectly hedged book the residual is ~0 and the two PnL legs are equal
+' and opposite.  A residual that is material against either leg means the cover
+' did not match the exposure, or moved at a different rate than the fix used to
+' translate the bonds - and that difference, not the gross FX line, is the only
+' part of it that is a real result.
+'
+' Quarantined bonds are excluded from the bond side here exactly as they are
+' everywhere else, so this block ties to the bridge above it.
+' =============================================================================
+
+Private Sub DashBuildFxHedgeView( _
+    ByVal ws As Worksheet, _
+    ByVal startRow As Long)
+
+    Dim r As Long
+    Dim exposureRow As Long
+    Dim coverRow As Long
+    Dim bondPnlRow As Long
+    Dim hedgePnlRow As Long
+    Dim residualRow As Long
+
+    ws.Cells(startRow, 1).value = "EUR/USD Hedge | Where The Currency PnL Sits"
+    ws.Cells(startRow, 1).Font.Bold = True
+    ws.Cells(startRow, 1).Font.Size = 12
+
+    ws.Cells(startRow + 2, 1).Resize(1, 3).value = Array("Measure", "EUR", "Note")
+    ws.Cells(startRow + 2, 1).Resize(1, 3).Font.Bold = True
+
+    r = startRow + 3
+
+    exposureRow = r
+    DashFxRow ws, r, "FX exposure on the bonds (opening EUR value, non-EUR)", _
+        DashSumFml("FX_Exposure_EUR"), _
+        "What the EUR/USD contracts exist to neutralise"
+    r = r + 1
+
+    coverRow = r
+    DashFxRow ws, r, "Notional in the EUR/USD hedging contracts", _
+        DashFxHedgeSumFml(DASH_FUT_NOTIONAL_COL), _
+        "Futures rows classified Hedge_Class = FX"
+    r = r + 1
+
+    DashFxRow ws, r, "Uncovered FX exposure", _
+        "B" & CStr(exposureRow) & "+B" & CStr(coverRow), _
+        "Exposure the hedge does not stand against"
+    r = r + 1
+
+    ws.Cells(r, 1).value = "Hedge cover ratio"
+    ws.Cells(r, 2).formula = "=" & DashSafeDiv( _
+        "-B" & CStr(coverRow), "B" & CStr(exposureRow))
+    ws.Cells(r, 2).numberFormat = "0.0%"
+    ws.Cells(r, 3).value = "100% = fully covered"
+    r = r + 2
+
+    bondPnlRow = r
+    DashFxRow ws, r, "FX translation PnL on the bonds", _
+        DashSumFml("PnL_FX"), _
+        "Opening exposure revalued at today''s fix"
+    r = r + 1
+
+    hedgePnlRow = r
+    DashFxRow ws, r, "PnL in the EUR/USD hedging contracts", _
+        DashFxHedgeSumFml(DASH_FUT_PNL_COL), _
+        "The other half of the same move"
+    r = r + 1
+
+    residualRow = r
+    ws.Cells(r, 1).value = "Net FX PnL after the hedge"
+    ws.Cells(r, 1).Font.Bold = True
+    ws.Cells(r, 2).formula = "=B" & CStr(bondPnlRow) & "+B" & CStr(hedgePnlRow)
+    ws.Cells(r, 2).Font.Bold = True
+    ws.Cells(r, 3).value = "The only part of the FX line that is a result"
+    r = r + 1
+
+    ' Judged against the LARGER leg: a residual of 10k is nothing beside a
+    ' 2m translation and everything beside a 20k one.
+    ws.Cells(r, 1).value = "Hedge slippage (net as a share of the gross move)"
+    ws.Cells(r, 2).formula = "=" & DashSafeDiv("ABS(B" & CStr(residualRow) & ")", _
+        "MAX(ABS(B" & CStr(bondPnlRow) & "),ABS(B" & CStr(hedgePnlRow) & "))")
+    ws.Cells(r, 2).numberFormat = "0.0%"
+    ws.Cells(r, 3).formula = "=IF(NOT(ISNUMBER(B" & CStr(r) & ")),""no FX position""," & _
+        "IF(B" & CStr(r) & "<=0.05,""OK - hedge is doing its job""," & _
+        """REVIEW - cover does not match the exposure""))"
+
+    ws.Range(ws.Cells(startRow + 3, 2), ws.Cells(residualRow, 2)).numberFormat = "#,##0"
+    ws.Range(ws.Cells(startRow + 2, 1), ws.Cells(r, 3)).Borders.LineStyle = xlContinuous
+
+    dashRowCursor = r
+
+End Sub
+
+
+Private Sub DashFxRow( _
+    ByVal ws As Worksheet, _
+    ByVal r As Long, _
+    ByVal label As String, _
+    ByVal expr As String, _
+    ByVal note As String)
+
+    ws.Cells(r, 1).value = label
+    ws.Cells(r, 2).formula = "=" & expr
+    ws.Cells(r, 3).value = note
+
+End Sub
+
+
+' Sum of one Futures column over the rows classified as FX hedges.
+'
+' Taken off the Futures sheet rather than off PNL_Attribution on purpose: a
+' currency hedge belongs to the BOOK, not to any one bond, so it has no row on
+' PNL_Attribution to be summed from - and the rates aggregates there now
+' exclude these rows precisely so their notional cannot be read as curve risk.
+Private Function DashFxHedgeSumFml(ByVal valueCol As String) As String
+
+    Dim fu As String
+    Dim last As String
+
+    fu = "'" & DASH_SH_FUTURES & "'!"
+    last = CStr(DashHedgeLastRow(DASH_SH_FUTURES, DASH_FUT_KEY_COL))
+
+    DashFxHedgeSumFml = "IFERROR(SUMIFS(" & _
+        fu & "$" & valueCol & "$" & CStr(DASH_DATA_ROW) & ":$" & valueCol & "$" & last & "," & _
+        fu & "$" & DASH_FUT_CLASS_COL & "$" & CStr(DASH_DATA_ROW) & ":$" & DASH_FUT_CLASS_COL & "$" & last & "," & _
+        """" & DASH_HEDGE_CLASS_FX & """),0)"
+
+End Function
+
+
+' =============================================================================
+' QUARANTINE
+'
+' Everything DashDetailCriteria dropped, and what it was worth.
+'
+' A bond is quarantined when its own attribution does not compute - see the
+' CD:CE block in modPNL for what counts.  When that happens its hedges go with
+' it: the futures and swaps mapped to that ISIN are aggregated onto the same
+' PNL_Attribution row, so excluding the row excludes them from every total on
+' this sheet automatically.  That is the correct treatment - a hedge PnL with
+' no computable bond leg beside it is half a position, and adding it to the
+' book total would book the hedge without the thing it hedges - but it must be
+' VISIBLE, or the book total quietly shrinks and nobody knows by how much.
+' This block is that reference: per bond, and totalled.
+'
+' The last two lines cover the other way a hedge can fall out of the totals:
+' a futures or swap row whose LinkedISIN is blank, or points at an ISIN that
+' is not on PNL_Attribution at all.  Those never reach a bond row to be
+' excluded from, so nothing above would ever mention them.
+' =============================================================================
+
+Private Sub DashBuildQuarantineView( _
+    ByVal ws As Worksheet, _
+    ByVal lastRow As Long, _
+    ByVal startRow As Long)
+
+    Dim n As Long
+    Dim r As Long
+    Dim rowCount As Long
+    Dim firstDetail As Long
+    Dim lastDetail As Long
+    Dim totalRow As Long
+
+    ' Listed rows are capped.  FILTER returns "" past the end of the quarantined
+    ' set, so reserving one row per bond meant a block of a couple of names
+    ' followed by two hundred blank bordered rows between the reader and the
+    ' end of the sheet.  The TOTAL line is computed from PNL_Attribution rather
+    ' than by summing the listing, so a capped list still reports the whole
+    ' amount - and it says so when it has been cut.
+    rowCount = lastRow - DASH_DATA_ROW + 1
+    If rowCount > DASH_QUARANTINE_MAX Then rowCount = DASH_QUARANTINE_MAX
+
+    ws.Cells(startRow, 1).value = "Quarantined Rows | Excluded From Every Total Above"
+    ws.Cells(startRow, 1).Font.Bold = True
+    ws.Cells(startRow, 1).Font.Size = 12
+
+    ws.Cells(startRow + 1, 1).value = _
+        "A bond whose attribution does not compute is dropped from the book totals, and its swaps and futures with it.  Nothing here reaches any other bond''s numbers."
+    ws.Cells(startRow + 1, 1).Font.Italic = True
+
+    ws.Cells(startRow + 3, 1).Resize(1, 10).value = Array( _
+        "ISIN", "Name", "CCY", "Why Excluded", "Attribution Status", _
+        "Official PnL", "Bond BPV", "Futures PnL", "Swap PnL", "Hedge BPV")
+    ws.Cells(startRow + 3, 1).Resize(1, 10).Font.Bold = True
+
+    firstDetail = startRow + 4
+
+    For n = 1 To rowCount
+        r = firstDetail + n - 1
+        ws.Cells(r, 1).formula = DashQuarantineCell("ISIN", n)
+        ws.Cells(r, 2).formula = DashQuarantineCell("Name", n)
+        ws.Cells(r, 3).formula = DashQuarantineCell("CCY", n)
+        ws.Cells(r, 4).formula = DashQuarantineCell("Row_Exclusion_Reason", n)
+        ws.Cells(r, 5).formula = DashQuarantineCell("Attribution_Status", n)
+        ws.Cells(r, 6).formula = DashQuarantineCell("Official_Total_PnL", n)
+        ws.Cells(r, 7).formula = DashQuarantineCell("Bond_DV01_Current", n)
+        ws.Cells(r, 8).formula = DashQuarantineCell("Actual_Futures_PnL", n)
+        ws.Cells(r, 9).formula = DashQuarantineCell("Actual_PlainSwap_PnL", n)
+        ws.Cells(r, 10).formula = DashQuarantineCell("Actual_Hedge_DV01", n)
+    Next n
+
+    lastDetail = firstDetail + rowCount - 1
+    totalRow = lastDetail + 1
+
+    ' Totalled straight off PNL_Attribution rather than by summing the block
+    ' above, so the total is right even if the listing is truncated.
+    ws.Cells(totalRow, 1).value = "TOTAL QUARANTINED"
+    ws.Cells(totalRow, 1).Font.Bold = True
+    ws.Cells(totalRow, 2).formula = "=""""&COUNTIFS(" & DashQuarantineCriteria() & ")&"" of ""&COUNTIFS(" & _
+        DashN("ISIN") & ",""<>""," & DashN("ISIN") & ",""<>TOTAL"")&"" bonds"""
+    ws.Cells(totalRow, 6).formula = "=" & DashSumQuarantinedFml("Official_Total_PnL")
+    ws.Cells(totalRow, 7).formula = "=" & DashSumQuarantinedFml("Bond_DV01_Current")
+    ws.Cells(totalRow, 8).formula = "=" & DashSumQuarantinedFml("Actual_Futures_PnL")
+    ws.Cells(totalRow, 9).formula = "=" & DashSumQuarantinedFml("Actual_PlainSwap_PnL")
+    ws.Cells(totalRow, 10).formula = "=" & DashSumQuarantinedFml("Actual_Hedge_DV01")
+    ws.Cells(totalRow, 1).Resize(1, 10).Font.Bold = True
+
+    r = totalRow + 1
+
+    ' Say so when the listing was cut, rather than letting the reader assume
+    ' the last name shown is the last one there is.
+    ws.Cells(r, 1).formula = _
+        "=IF(COUNTIFS(" & DashQuarantineCriteria() & ")>" & CStr(rowCount) & "," & _
+        """showing the first " & CStr(rowCount) & "; """ & _
+        "&COUNTIFS(" & DashQuarantineCriteria() & ")-" & CStr(rowCount) & _
+        "&"" more are in the TOTAL above but not listed"","""")"
+    ws.Cells(r, 1).Font.Italic = True
+
+    r = r + 2
+
+    ws.Cells(r, 1).value = "Hedges attached to no bond row (never reach any total)"
+    ws.Cells(r, 1).Font.Bold = True
+    r = r + 1
+
+    ws.Cells(r, 1).value = "Futures with blank or unmatched LinkedISIN"
+    ws.Cells(r, 8).formula = "=" & DashOrphanHedgeSumFml( _
+        DASH_SH_FUTURES, DASH_FUT_KEY_COL, DASH_FUT_LINK_COL, DASH_FUT_PNL_COL)
+    r = r + 1
+
+    ws.Cells(r, 1).value = "Swaps with blank or unmatched LinkedISIN"
+    ws.Cells(r, 9).formula = "=" & DashOrphanHedgeSumFml( _
+        DASH_SH_SWAPS, DASH_SWAP_KEY_COL, DASH_SWAP_LINK_COL, DASH_SWAP_PNL_COL)
+
+    ws.Range(ws.Cells(firstDetail, 6), ws.Cells(r, 10)).numberFormat = "#,##0"
+    ws.Range(ws.Cells(startRow + 3, 1), ws.Cells(totalRow, 10)).Borders.LineStyle = xlContinuous
+
+    dashRowCursor = r
+
+End Sub
+
+
+' The k'th quarantined row's value in one column, "" once the quarantined rows
+' run out.  FILTER collapses the gaps, so the block reads as a list of the
+' excluded bonds rather than as the full book with most of it blanked.
+Private Function DashQuarantineCell( _
+    ByVal headerName As String, _
+    ByVal n As Long) As String
+
+    ' The closing bracket after the FILTER condition is load-bearing: without
+    ' it the position argument lands inside FILTER as its if_empty, INDEX is
+    ' left with one argument, and the whole formula is one bracket short.
+    ' Excel rejects an invalid formula on assignment with run-time error 1004,
+    ' so this did not produce a bad cell - it aborted the Dashboard build here
+    ' and everything below this block was never drawn.
+    '
+    '   INDEX( FILTER( values , include ) , k )
+    '
+    DashQuarantineCell = "=IFERROR(INDEX(FILTER(" & DashN(headerName) & "," & _
+        "(" & DashN("Row_Valid") & "=0)*(" & DashN("ISIN") & "<>""""))," & _
+        CStr(n) & "),"""")"
+
+End Function
+
+
+' PnL on hedge rows that no PNL_Attribution row can account for: LinkedISIN
+' blank, or naming an ISIN the sheet does not carry.  Summed off the hedge
+' sheet directly - by construction there is no bond row to read it from.
+Private Function DashOrphanHedgeSumFml( _
+    ByVal sheetName As String, _
+    ByVal keyCol As String, _
+    ByVal linkCol As String, _
+    ByVal pnlCol As String) As String
+
+    Dim sh As String
+    Dim last As String
+    Dim linkRng As String
+    Dim pnlRng As String
+    Dim notFx As String
+
+    sh = "'" & sheetName & "'!"
+    last = CStr(DashHedgeLastRow(sheetName, keyCol))
+
+    linkRng = sh & "$" & linkCol & "$" & CStr(DASH_DATA_ROW) & ":$" & linkCol & "$" & last
+    pnlRng = sh & "$" & pnlCol & "$" & CStr(DASH_DATA_ROW) & ":$" & pnlCol & "$" & last
+
+    ' An EUR/USD hedge legitimately has no LinkedISIN - it hedges the book, not
+    ' a bond - so without this it would be counted here AND in the FX block, and
+    ' the reader would be told twice about the same money in two different
+    ' places under two different explanations.  The two blocks partition the
+    ' Futures sheet instead.
+    notFx = ""
+    If sheetName = DASH_SH_FUTURES Then
+        notFx = ",--(" & sh & "$" & DASH_FUT_CLASS_COL & "$" & CStr(DASH_DATA_ROW) & _
+            ":$" & DASH_FUT_CLASS_COL & "$" & last & "<>""" & DASH_HEDGE_CLASS_FX & """)"
+    End If
+
+    DashOrphanHedgeSumFml = "IFERROR(SUMPRODUCT(" & _
+        "--ISNA(MATCH(" & linkRng & "," & DashN("ISIN") & ",0))" & notFx & "," & _
+        "IFERROR(" & pnlRng & ",0)),0)"
+
+End Function
+
+
+Private Sub DashBuildChartsSafe(ByVal ws As Worksheet)
+
+
+    ' Anchor column, not an absolute cell: the blocks flow, so each chart takes
+    ' its row from the range it plots and only its column is a layout choice.
+    DashAddChartSafe ws, "chtFactorPnL", xlColumnClustered, _
+        "DashChartBridge", "E", 560, 300, _
+        "PnL Attribution and Hedge Bridge"
+
+
+    DashAddChartSafe ws, "chtCarry", xlColumnClustered, _
+        "DashChartCarry", "E", 360, 200, _
+        "Carry Breakdown"
+
+
+    DashAddChartSafe ws, "chtHedge", xlColumnClustered, _
+        "DashChartHedge", "E", 420, 220, _
+        "Model vs Actual Hedge PnL"
+
+
+    ' Column J, clear of the status (D) and framework (G) count blocks that sit
+    ' alongside the efficiency table.
+    DashAddChartSafe ws, "chtEfficiency", xlColumnClustered, _
+        "DashChartEfficiency", "J", 360, 220, _
+        "Hedge Efficiency Distribution"
+
+
+End Sub
+
+
+Private Sub DashAddChartSafe( _
+    ByVal ws As Worksheet, _
+    ByVal chartName As String, _
+    ByVal chartKind As XlChartType, _
+    ByVal sourceName As String, _
+    ByVal anchorColumn As String, _
+    ByVal chartWidth As Double, _
+    ByVal chartHeight As Double, _
+    ByVal titleText As String)
+
+
+    Dim co As chartObject
+    Dim src As Range
+    Dim anchor As Range
+
+
+    On Error GoTo ChartFail
+
+
+    Set src = ThisWorkbook.Names(sourceName).RefersToRange
+    Set anchor = ws.Range(anchorColumn & CStr(src.Row))
+
+
+    Set co = ws.ChartObjects.Add( _
+        anchor.Left, _
+        anchor.top, _
+        chartWidth, _
+        chartHeight)
+
+
+    co.Name = chartName
+
+
+    With co.Chart
+
+
+        .chartType = chartKind
+        .SetSourceData Source:=src
+        .HasTitle = True
+
+
+        On Error Resume Next
+        .ChartTitle.Text = titleText
+        On Error GoTo ChartFail
+
+
+        .HasLegend = False
+
+
+    End With
+
+
+    Exit Sub
+
+
+ChartFail:
+
+
+    ' A chart is presentation, not data.  Never let one stop the build.
+    On Error Resume Next
+
+
+    If Not co Is Nothing Then
+        co.Delete
+    End If
+
+
+    On Error GoTo 0
+
+
+End Sub
+
+
+' =============================================================================
+' FORMATTING
+' =============================================================================
+
+
+Private Sub DashFormatDashboard(ByVal ws As Worksheet)
+
+
+    On Error Resume Next
+
+
+    ws.Columns("A:AB").AutoFit
+
+
+    ws.Columns("A").ColumnWidth = 34
+    ws.Columns("B").ColumnWidth = 18
+    ws.Columns("C").ColumnWidth = 14
+
+
+    ws.Range("A1:AB4000").VerticalAlignment = xlCenter
+
+
+    ws.Activate
+    ActiveWindow.FreezePanes = False
+    ws.Range("A6").Select
+    ActiveWindow.FreezePanes = True
+    ws.Range("A1").Select
+
+
+    On Error GoTo 0
+
+
+End Sub
+
+

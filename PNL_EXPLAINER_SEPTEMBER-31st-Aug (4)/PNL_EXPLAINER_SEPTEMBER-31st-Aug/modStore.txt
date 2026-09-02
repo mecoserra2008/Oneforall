@@ -1,0 +1,1996 @@
+Option Explicit
+
+' =============================================================================
+' modStore  -  the run store, as files
+'
+' WHAT THIS IS FOR
+'
+'   The workbook holds one day.  Load tomorrow and today is gone: the bond
+'   population, the prices, the curves, the whole attribution - overwritten in
+'   place, because a sheet is a single mutable value and there is nowhere else
+'   for it to go.  Every question that starts "what did we hold on..." is
+'   therefore unanswerable, and every answer the workbook gives is
+'   unauditable, since the inputs that produced it no longer exist.
+'
+'   This gives them somewhere else to go: a folder of CSV files per run,
+'   written beside the workbook.  A later run writes a new folder.
+'   PNL_Attribution and the Dashboard are served from the latest.
+'
+' WHY FILES AND NOT A DATABASE
+'
+'   The previous version of this module used Access.  Everything it did worked,
+'   and none of it needed a database: the ACE engine is a separate install that
+'   must match Excel's BITNESS, and getting that wrong is the one setup failure
+'   whose real cause the provider's own error message never mentions.  A folder
+'   of CSVs needs nothing installed, opens in anything, and can be read by a
+'   person.
+'
+'   What carried over unchanged is the part that was actually hard: the
+'   position keys, the run fingerprint and the two duplicate guards.
+'
+' THE THREE GUARANTEES, UNCHANGED
+'
+'   1  RUN SEPARATION.  A run is a folder.  Runs never edit each other; a save
+'      creates a folder and writes into it.  History is a property of the
+'      filesystem rather than a discipline somebody has to keep.
+'
+'   2  NO DUPLICATE POSITION WITHIN A RUN.  Each position gets a PositionKey
+'      built from the fields that make it distinct.  A repeat is refused and
+'      written to Run_Issue.csv with the sheet row it came from and the row it
+'      duplicated - not silently dropped.
+'
+'   3  NO DUPLICATE RUN.  Each run carries a fingerprint - a hash over every
+'      position key it holds - and a save whose fingerprint matches the latest
+'      run for the same reporting date is refused, returning that run instead
+'      of writing a second copy of it.
+'
+' WHAT A SNAPSHOT CONTAINS, AND WHY IT IS MORE THAN POSITIONS
+'
+'   The Access version stored position IDENTITY only - no prices, no DV01s, no
+'   PnL.  That cannot reproduce a run: reopening it re-queries Bloomberg and
+'   reprices at today's market.  So a snapshot is every sheet the numbers
+'   depend on, as VALUES:
+'
+'     Bonds, Swaps, Futures    positions AND the market data and risk computed
+'                              over them
+'     OIS_Curves               the invisible dependency.  NO cell anywhere
+'                              references it; InterpOIS, InterpGov, InterpSwap
+'                              and BondPullToParPrice reach it through the
+'                              object model, and BondPullToParPrice runs on
+'                              every PNL row via Carry_RollToPar.  Omit it and
+'                              that column silently recomputes against whatever
+'                              curve is on the sheet later.
+'     PNL_Attribution          the output, 84 columns
+'     SpreadOverride           manual, single copy, chooses the attribution
+'                              chain per bond
+'     FutMap                   manual, single copy, chooses which Bloomberg
+'                              generic each OPICS code resolves to - so it
+'                              chooses the price
+'     Config                   the cells the formulas read
+'
+'   Futures and Swaps are in there for a second reason: the DASHBOARD reads
+'   them directly.  The book's Actual total and the whole FX-hedge block come
+'   off Futures!, not off PNL_Attribution, so restoring the attribution alone
+'   would leave both wrong.
+'
+'   Not stored: Coverage support and Coverage Total support, which say in their
+'   own A2 that they are cleared once the maps are built; Dashboard, which is
+'   derivable; BBG_T0_Staging, whose constant is referenced nowhere.
+'
+' WHERE THE PIECES ARE
+'
+'   Config!B41   runs root      (blank = PNL_Runs beside the workbook)
+'   Config!B42   autosave       TRUE = Store_RunAndSave saves without asking
+'   Config!B43   last run saved  (written here, do not edit)
+'   Config!B44   last message    (written here, do not edit)
+'   Config!B45   unused - every run is kept
+'
+' Buttons:  Store_RunAndSave, Store_LoadLatestAndBuild, Store_ShowRunHistory,
+'           Store_SaveCurrentRun, Store_LoadRun, Store_OpenRunsFolder.
+'
+' modStore calls INTO modPNL and modDashboard and is never called back.  That
+' direction is deliberate: modPNL has to compile on its own, and it did not
+' when the store put two calls into its buttons.
+' =============================================================================
+
+
+' --- Config cells this module owns -------------------------------------------
+Private Const ST_SH_CONFIG As String = "Config"
+Private Const ST_CFG_ROOT     As String = "B41"
+Private Const ST_CFG_AUTOSAVE As String = "B42"
+Private Const ST_CFG_LAST_RUN As String = "B43"
+Private Const ST_CFG_STATUS   As String = "B44"
+
+Private Const ST_SH_HISTORY As String = "Run_History"
+
+' The folder that holds the run folders, and the prefix each one starts with.
+'
+' run_YYYYMMDD_HHMMSS sorts lexicographically in timestamp order, which is the
+' whole trick: "the latest run" is a string comparison over folder names.  No
+' index file to corrupt, no manifest to parse before you can find anything, and
+' no clock arithmetic.
+Private Const ST_RUNS_FOLDER As String = "PNL_Runs"
+Private Const ST_RUN_PREFIX  As String = "run_"
+
+' A position key longer than this is refused rather than truncated: truncating
+' would make two different positions share a key, and a silent merge is worse
+' than a visible refusal.
+Private Const ST_MAX_KEY_LEN As Long = 200
+
+' Runaway guard on the issue log.
+Private Const ST_MAX_ISSUES As Long = 500
+
+' What joins the components of a position key.
+'
+' The separator has to be a character none of the components can contain.  "|"
+' would be wrong for swaps, whose mapping-row id is itself built out of "|" -
+' two different mappings could then produce one key by accident.  Chr(11) is
+' equally impossible in an ISIN, a portfolio code or a contract code.
+'
+' vbVerticalTab, not ChrW$(11): a Const must be a constant EXPRESSION, so
+' `= ChrW$(11)` is a COMPILE error, at a line that has nothing to do with what
+' you were editing.
+Private Const ST_KEY_SEP As String = vbVerticalTab
+
+' ADODB.Stream text modes.  Spelled out because the module is late-bound.
+Private Const ST_ADO_TYPE_TEXT As Long = 2
+Private Const ST_ADO_READ_ALL  As Long = -1
+Private Const ST_ADO_SAVE_OVERWRITE As Long = 2
+
+' Stamped into every manifest, so a folder says which module wrote it.
+Private Const ST_VERSION As String = "store-1"
+
+' The three files a run folder carries besides the sheet snapshots.
+'
+' run.csv is written LAST, so a folder without one is a folder whose write
+' did not finish - which is what the run list and the duplicate guard both
+' key off, instead of trusting that every folder present is complete.
+Private Const ST_FILE_RUN    As String = "run.csv"
+Private Const ST_FILE_ISSUES As String = "Run_Issue.csv"
+Private Const ST_FILE_CONFIG As String = "Config.csv"
+
+
+' =============================================================================
+' CSV
+'
+' RFC 4180, and the three rules that matter are all about the same thing -
+' a value that contains the delimiter, the quote, or a line break must survive
+' the round trip unchanged.  A bond name with a comma in it is not exotic.
+'
+'   quote a field if it contains a comma, a quote, CR or LF, or leading or
+'   trailing space
+'   double every quote inside a quoted field
+'   read it back by walking characters, never by Split(line, ",")
+'
+' Split-on-comma is the bug this exists to avoid: it works on every file
+' anyone tests it with and then silently mangles the first row that has a
+' comma inside a name.
+' =============================================================================
+
+Public Function StoreCsvField(ByVal v As Variant) As String
+
+    Dim s As String
+    Dim vt As Long
+
+    If IsError(v) Then Exit Function
+    If IsNull(v) Or IsEmpty(v) Then Exit Function
+
+    vt = VarType(v)
+
+    If vt = vbBoolean Then
+        s = IIf(CBool(v), "TRUE", "FALSE")
+
+    ElseIf vt = vbDate Then
+        ' .Value2 hands dates back as serials, so this is belt and braces.  Left
+        ' to CStr a date would render in the machine's short-date format, and
+        ' 03/07/2026 means two different days on two desks.
+        s = StoreNumberText(CDbl(v))
+
+    ElseIf (vt >= vbInteger And vt <= vbCurrency) _
+           Or vt = 14 Or vt = 17 Or vt = 20 Then
+        ' 2..6 are Integer through Currency.  14, 17 and 20 are Decimal, Byte
+        ' and LongLong, spelled as numbers because vbDecimal and vbByte are not
+        ' defined in every Basic this file is checked against.
+        s = StoreNumberText(v)
+
+    Else
+        s = CStr(v)
+
+    End If
+
+    If InStr(s, ",") > 0 Or InStr(s, """") > 0 _
+       Or InStr(s, vbCr) > 0 Or InStr(s, vbLf) > 0 _
+       Or s <> Trim$(s) Then
+        StoreCsvField = """" & Replace(s, """", """""") & """"
+    Else
+        StoreCsvField = s
+    End If
+
+End Function
+
+
+' One 2-D array to one CSV string.  Row 0 is the header, exactly as
+' PnlPositionsForStore produces it and PnlRestorePositions expects it.
+Public Function StoreCsvText(ByVal data As Variant) As String
+
+    Dim recs() As String
+    Dim flds() As String
+    Dim i As Long
+    Dim j As Long
+
+    If IsEmpty(data) Then Exit Function
+    If Not IsArray(data) Then Exit Function
+
+    ReDim recs(LBound(data, 1) To UBound(data, 1))
+
+    For i = LBound(data, 1) To UBound(data, 1)
+        ReDim flds(LBound(data, 2) To UBound(data, 2))
+        For j = LBound(data, 2) To UBound(data, 2)
+            flds(j) = StoreCsvField(data(i, j))
+        Next j
+        recs(i) = Join(flds, ",")
+    Next i
+
+    StoreCsvText = Join(recs, vbCrLf)
+
+End Function
+
+
+' One CSV string back to the same 2-D array shape.
+'
+' Walks characters.  Inside a quoted field a comma is data, a doubled quote is
+' one quote, and a line break is part of the value; outside one they end the
+' field, the field, and the record.
+Public Function StoreCsvParse(ByVal csv As String) As Variant
+
+    Dim outv() As Variant
+    Dim cur As String
+    Dim inQuotes As Boolean
+    Dim pass As Long
+    Dim i As Long
+    Dim n As Long
+    Dim ch As String
+    Dim r As Long
+    Dim c As Long
+    Dim nRows As Long
+    Dim widest As Long
+    Dim endOfField As Boolean
+    Dim endOfRecord As Boolean
+
+    n = Len(csv)
+    If n = 0 Then
+        StoreCsvParse = Empty
+        Exit Function
+    End If
+
+    ' TWO PASSES over the same state machine: the first counts records and the
+    ' widest record, the second fills the array.
+    '
+    ' The obvious single pass needs a growing buffer, and a growing buffer is
+    ' what this cost an afternoon on: a ReDim-ed local array accepted every
+    ' assignment and read back empty, while the record and field COUNTS stayed
+    ' perfectly correct - the most misleading shape a bug can take, because
+    ' every bound was right and every value was gone.  Walking the string twice
+    ' costs nothing on a file this size and needs no buffer at all.
+    For pass = 1 To 2
+
+        If pass = 2 Then
+            If nRows = 0 Or widest = 0 Then
+                StoreCsvParse = Empty
+                Exit Function
+            End If
+            ReDim outv(0 To nRows - 1, 0 To widest - 1)
+        End If
+
+        cur = ""
+        inQuotes = False
+        r = 0
+        c = 0
+        i = 1
+
+        Do While i <= n
+
+            ch = Mid$(csv, i, 1)
+            endOfField = False
+            endOfRecord = False
+
+            If inQuotes Then
+
+                If ch = """" Then
+                    If Mid$(csv, i + 1, 1) = """" Then
+                        cur = cur & """"
+                        i = i + 1
+                    Else
+                        inQuotes = False
+                    End If
+                Else
+                    cur = cur & ch
+                End If
+
+            ElseIf ch = """" Then
+                inQuotes = True
+
+            ElseIf ch = "," Then
+                endOfField = True
+
+            ElseIf ch = vbCr Or ch = vbLf Then
+                ' CRLF is one break, not two.
+                If ch = vbCr Then
+                    If Mid$(csv, i + 1, 1) = vbLf Then i = i + 1
+                End If
+                endOfField = True
+                endOfRecord = True
+
+            Else
+                cur = cur & ch
+            End If
+
+            If endOfField Then
+                If pass = 2 Then
+                    If r <= UBound(outv, 1) And c <= UBound(outv, 2) Then
+                        outv(r, c) = cur
+                    End If
+                End If
+                cur = ""
+                c = c + 1
+            End If
+
+            If endOfRecord Then
+                If pass = 1 Then
+                    If c > widest Then widest = c
+                End If
+                r = r + 1
+                c = 0
+            End If
+
+            i = i + 1
+
+        Loop
+
+        ' A file that does not end in a newline still has a last record.
+        If Len(cur) > 0 Or c > 0 Then
+            If pass = 2 Then
+                If r <= UBound(outv, 1) And c <= UBound(outv, 2) Then
+                    outv(r, c) = cur
+                End If
+            End If
+            c = c + 1
+            If pass = 1 Then
+                If c > widest Then widest = c
+            End If
+            r = r + 1
+        End If
+
+        If pass = 1 Then nRows = r
+
+    Next pass
+
+    StoreCsvParse = outv
+
+End Function
+
+
+' -----------------------------------------------------------------------------
+' THE BYTES ON DISK
+'
+' UTF-8 with a BOM, through ADODB.Stream.
+'
+' ADO, deliberately - it ships with Windows and needs nothing installed, which
+' is the whole reason the Access store was dropped.  VBA's own Print # writes
+' the machine's ANSI codepage, so a bond named "Varia" + cedilla-a-o would come
+' back as mojibake on a desk with a different regional setting, or be lost
+' outright.  The BOM is what makes Excel open the file correctly on a plain
+' double-click rather than importing the accented bytes as Latin-1.
+' -----------------------------------------------------------------------------
+
+Public Sub StoreWriteText(ByVal path As String, ByVal content As String)
+
+    Dim st As Object
+
+    Set st = CreateObject("ADODB.Stream")
+    st.Type = ST_ADO_TYPE_TEXT
+    st.Charset = "UTF-8"
+    st.Open
+    st.WriteText content
+    st.SaveToFile path, ST_ADO_SAVE_OVERWRITE
+    st.Close
+
+    Set st = Nothing
+
+End Sub
+
+
+Public Function StoreReadText(ByVal path As String) As String
+
+    Dim st As Object
+    Dim s As String
+
+    If Len(path) = 0 Then Exit Function
+
+    On Error Resume Next
+    If Len(Dir$(path)) = 0 Then Exit Function
+    On Error GoTo 0
+
+    Set st = CreateObject("ADODB.Stream")
+    st.Type = ST_ADO_TYPE_TEXT
+    st.Charset = "UTF-8"
+    st.Open
+    st.LoadFromFile path
+    s = st.ReadText(ST_ADO_READ_ALL)
+    st.Close
+
+    Set st = Nothing
+
+    ' Some versions of ADO hand back the BOM as a leading U+FEFF character and
+    ' some swallow it.  Left in place it becomes part of the first header name,
+    ' so StoreColumnOf would never match the first column - the failure would
+    ' look like "ISIN is missing" on a file whose first field is plainly ISIN.
+    ' AscW is signed, so U+FEFF reads as -257.
+    If Len(s) > 0 Then
+        If AscW(Left$(s, 1)) = -257 Or AscW(Left$(s, 1)) = 65279 Then
+            s = Mid$(s, 2)
+        End If
+    End If
+
+    StoreReadText = s
+
+End Function
+
+
+Public Sub StoreWriteCsv(ByVal path As String, ByVal data As Variant)
+    StoreWriteText path, StoreCsvText(data)
+End Sub
+
+
+Public Function StoreReadCsv(ByVal path As String) As Variant
+    StoreReadCsv = StoreCsvParse(StoreReadText(path))
+End Function
+
+
+' =============================================================================
+' RUN FOLDERS
+'
+' PNL_Runs\run_YYYYMMDD_HHMMSS\ beside the workbook.
+'
+' The timestamp is fixed-width and big-endian, so folder names sort in
+' chronological order as plain strings.  "The latest run" is therefore a string
+' comparison over a directory listing - no index, no manifest to read first,
+' nothing that can disagree with the folders actually on disk.
+' =============================================================================
+
+Public Function StoreRunsRoot() As String
+
+    Dim ws As Worksheet
+    Dim configured As String
+    Dim folder As String
+
+    folder = ThisWorkbook.Path
+    If Len(folder) = 0 Then folder = CurDir$
+
+    On Error Resume Next
+    Set ws = ThisWorkbook.Worksheets(ST_SH_CONFIG)
+    On Error GoTo 0
+
+    If Not ws Is Nothing Then
+        configured = Trim$(CStr(ws.Range(ST_CFG_ROOT).value))
+    End If
+
+    If Len(configured) = 0 Then
+        StoreRunsRoot = folder & Application.PathSeparator & ST_RUNS_FOLDER
+        Exit Function
+    End If
+
+    ' A bare name, or anything without a drive or a UNC prefix, is relative to
+    ' the workbook - so a shared drive can be named in full and a subfolder can
+    ' be named in one word.
+    If InStr(configured, ":") = 0 And Left$(configured, 2) <> "\\" Then
+        StoreRunsRoot = folder & Application.PathSeparator & configured
+    Else
+        StoreRunsRoot = configured
+    End If
+
+End Function
+
+
+' The run-folder name for a moment in time.  Pure, so the sort order it relies
+' on can be tested without a filesystem.
+Public Function StoreRunFolderName(ByVal whenUtc As Date) As String
+
+    StoreRunFolderName = ST_RUN_PREFIX & _
+        StorePad(Year(whenUtc), 4) & StorePad(Month(whenUtc), 2) & _
+        StorePad(Day(whenUtc), 2) & "_" & _
+        StorePad(Hour(whenUtc), 2) & StorePad(Minute(whenUtc), 2) & _
+        StorePad(Second(whenUtc), 2)
+
+End Function
+
+
+Private Function StorePad(ByVal n As Long, ByVal padTo As Long) As String
+
+    Dim s As String
+
+    ' Str$, not CStr: Str$ never uses the machine's decimal separator and never
+    ' surprises on a comma-decimal locale.
+    s = Trim$(Str$(n))
+
+    Do While Len(s) < padTo
+        s = "0" & s
+    Loop
+
+    StorePad = s
+
+End Function
+
+
+Private Function StoreEnsureFolder(ByVal path As String) As Boolean
+
+    On Error Resume Next
+
+    If Len(Dir$(path, vbDirectory)) = 0 Then MkDir path
+
+    StoreEnsureFolder = (Len(Dir$(path, vbDirectory)) > 0)
+    Err.Clear
+
+    On Error GoTo 0
+
+End Function
+
+
+' The newest run folder, or "" when there is none.
+'
+' Compared as strings, which is only correct because StoreRunFolderName is
+' fixed-width - a name like run_2026831_93000 would sort after
+' run_20260901_090000 and quietly serve the wrong day.
+Public Function StoreLatestRunFolder() As String
+
+    Dim root As String
+    Dim nm As String
+    Dim best As String
+
+    root = StoreRunsRoot()
+    If Len(Dir$(root, vbDirectory)) = 0 Then Exit Function
+
+    nm = Dir$(root & Application.PathSeparator & ST_RUN_PREFIX & "*", vbDirectory)
+
+    Do While Len(nm) > 0
+        If nm <> "." And nm <> ".." Then
+            If Left$(nm, Len(ST_RUN_PREFIX)) = ST_RUN_PREFIX Then
+                If nm > best Then best = nm
+            End If
+        End If
+        nm = Dir$
+    Loop
+
+    If Len(best) = 0 Then Exit Function
+
+    StoreLatestRunFolder = root & Application.PathSeparator & best
+
+End Function
+
+
+' Every run folder, oldest first.
+Public Function StoreAllRunFolders() As Variant
+
+    Dim root As String
+    Dim nm As String
+    Dim names As Object
+    Dim sorted() As String
+    Dim k As Variant
+    Dim i As Long
+    Dim j As Long
+    Dim tmp As String
+
+    Set names = CreateObject("Scripting.Dictionary")
+    root = StoreRunsRoot()
+
+    If Len(Dir$(root, vbDirectory)) > 0 Then
+        nm = Dir$(root & Application.PathSeparator & ST_RUN_PREFIX & "*", vbDirectory)
+        Do While Len(nm) > 0
+            If Left$(nm, Len(ST_RUN_PREFIX)) = ST_RUN_PREFIX Then names(nm) = True
+            nm = Dir$
+        Loop
+    End If
+
+    If names.Count = 0 Then
+        StoreAllRunFolders = Array()
+        Exit Function
+    End If
+
+    ReDim sorted(0 To names.Count - 1)
+    i = 0
+    For Each k In names.keys
+        sorted(i) = CStr(k)
+        i = i + 1
+    Next k
+
+    ' Insertion sort.  The list is a handful of folders per week, and a sort
+    ' that is obviously correct beats a fast one nobody can check.
+    For i = 1 To UBound(sorted)
+        tmp = sorted(i)
+        j = i - 1
+        Do While j >= 0
+            If sorted(j) <= tmp Then Exit Do
+            sorted(j + 1) = sorted(j)
+            j = j - 1
+        Loop
+        sorted(j + 1) = tmp
+    Next i
+
+    StoreAllRunFolders = sorted
+
+End Function
+
+
+Public Function StoreHash32(ByVal s As String) As String
+
+    Dim h As Double
+    Dim i As Long
+    Dim c As Long
+
+    h = 2166136261#
+
+    For i = 1 To Len(s)
+
+        ' AscW returns a SIGNED Integer, so anything above U+7FFF comes back
+        ' negative.  Folding it back up is what makes the hash the same number
+        ' here and in the test harness, which uses a host whose Asc is not
+        ' signed - a masking AND would quietly differ between the two.
+        c = AscW(Mid$(s, i, 1))
+        If c < 0 Then c = c + 65536
+
+        h = StoreXor32(h, CDbl(c))
+        h = StoreMul32(h, 16777619#)
+    Next i
+
+    StoreHash32 = StoreHex32(h)
+
+End Function
+
+
+Private Function StoreXor32(ByVal a As Double, ByVal b As Double) As Double
+
+    Dim aHi As Long
+    Dim aLo As Long
+    Dim bHi As Long
+    Dim bLo As Long
+
+    aHi = CLng(Int(a / 65536#))
+    aLo = CLng(a - aHi * 65536#)
+    bHi = CLng(Int(b / 65536#))
+    bLo = CLng(b - bHi * 65536#)
+
+    StoreXor32 = (aHi Xor bHi) * 65536# + (aLo Xor bLo)
+
+End Function
+
+
+Private Function StoreMul32(ByVal a As Double, ByVal b As Double) As Double
+
+    Dim aHi As Double
+    Dim aLo As Double
+    Dim hi As Double
+    Dim r As Double
+
+    aHi = Int(a / 65536#)
+    aLo = a - aHi * 65536#
+
+    ' Only the low 16 bits of the high half survive a 32-bit truncation, so
+    ' they are reduced BEFORE being shifted back up - otherwise the product
+    ' leaves the range a Double represents exactly.
+    hi = aHi * b
+    hi = hi - Int(hi / 65536#) * 65536#
+
+    r = hi * 65536# + aLo * b
+
+    StoreMul32 = r - Int(r / 4294967296#) * 4294967296#
+
+End Function
+
+
+Private Function StoreHex32(ByVal v As Double) As String
+
+    Dim digits As String
+    Dim outS As String
+    Dim x As Double
+    Dim d As Long
+    Dim i As Long
+
+    digits = "0123456789abcdef"
+    x = v
+
+    For i = 1 To 8
+        d = CLng(x - Int(x / 16#) * 16#)
+        outS = Mid$(digits, d + 1, 1) & outS
+        x = Int(x / 16#)
+    Next i
+
+    StoreHex32 = outS
+
+End Function
+
+
+' The fingerprint of one kind's key list.  Separated from StoreHash32 so the
+' joining rule - a newline between keys, so "AB" + "C" cannot collide with
+' "A" + "BC" - is stated once and tested.
+Public Function StoreFingerprintOfKeys(ByVal keys As Variant) As String
+
+    Dim s As String
+    Dim i As Long
+
+    If Not IsArray(keys) Then
+        StoreFingerprintOfKeys = StoreHash32("")
+        Exit Function
+    End If
+
+    If UBound(keys) < LBound(keys) Then
+        StoreFingerprintOfKeys = StoreHash32("")
+        Exit Function
+    End If
+
+    For i = LBound(keys) To UBound(keys)
+        s = s & CStr(keys(i)) & vbLf
+    Next i
+
+    StoreFingerprintOfKeys = StoreHash32(s)
+
+End Function
+
+
+Public Function StoreBondPositionKey( _
+    ByVal isin As Variant, _
+    ByVal portfolio As Variant, _
+    ByVal acctgCat As Variant) As String
+
+    ' AcctgCat is in the key because one ISIN can be held in two accounting
+    ' categories in the same portfolio, and they are two positions with two
+    ' book values.  Keying on (ISIN, Portfolio) alone would keep whichever
+    ' arrived first and refuse the other as a duplicate.
+    StoreBondPositionKey = StoreJoinKey(Array( _
+        UCase$(StoreClean(isin)), _
+        UCase$(StoreClean(portfolio)), _
+        UCase$(StoreClean(acctgCat))))
+
+End Function
+
+
+Public Function StoreSwapPositionKey(ByVal mappingRowId As Variant) As String
+
+    ' Swaps!A already holds a unique mapping-row id, built by
+    ' AppendSwapMapRowsToSwaps out of source|id|LinkedISIN|row precisely so
+    ' that one swap hedging two bonds is two rows.  Re-deriving a key here
+    ' would be a second opinion on a question the sheet has already answered.
+    StoreSwapPositionKey = StoreClean(mappingRowId)
+
+End Function
+
+
+Public Function StoreFuturePositionKey( _
+    ByVal hedgeSource As Variant, _
+    ByVal coverageSourceRow As Variant, _
+    ByVal contractCode As Variant, _
+    ByVal linkedIsin As Variant) As String
+
+    ' HedgeSource leads because it is what scopes the rest: the two Hedge Risco
+    ' books number their coverage rows independently, so row 163 means one
+    ' thing in Tx Juro and another in Total.  Drop it and one of the two is
+    ' discarded as a duplicate of the other - silently, and the bond it hedged
+    ' reads as unhedged.
+    StoreFuturePositionKey = StoreJoinKey(Array( _
+        UCase$(StoreClean(hedgeSource)), _
+        StoreClean(coverageSourceRow), _
+        UCase$(StoreClean(contractCode)), _
+        UCase$(StoreClean(linkedIsin))))
+
+End Function
+
+
+Private Function StoreJoinKey(ByVal parts As Variant) As String
+
+    Dim s As String
+    Dim i As Long
+
+    For i = LBound(parts) To UBound(parts)
+        If i > LBound(parts) Then s = s & ST_KEY_SEP
+        s = s & CStr(parts(i))
+    Next i
+
+    StoreJoinKey = s
+
+End Function
+
+
+Private Function StoreClean(ByVal v As Variant) As String
+
+    If IsNull(v) Or IsEmpty(v) Then Exit Function
+    If IsError(v) Then Exit Function
+
+    StoreClean = Trim$(CStr(v))
+
+End Function
+
+
+' The key for one row of a PnlPositionsForStore array, by kind.  This is the
+' only place that knows which fields feed which key, so adding a component is
+' one edit here plus one in the key function itself.
+Private Function StoreKeyForRow( _
+    ByVal kind As String, _
+    ByVal data As Variant, _
+    ByVal rowIndex As Long, _
+    ByVal cols As Object) As String
+
+    Select Case UCase$(kind)
+
+    Case "BOND"
+        StoreKeyForRow = StoreBondPositionKey( _
+            StoreCell(data, rowIndex, cols, "ISIN"), _
+            StoreCell(data, rowIndex, cols, "Portfolio"), _
+            StoreCell(data, rowIndex, cols, "AcctgCat"))
+
+    Case "SWAP"
+        StoreKeyForRow = StoreSwapPositionKey( _
+            StoreCell(data, rowIndex, cols, "PositionKey"))
+
+    Case "FUTURE"
+        StoreKeyForRow = StoreFuturePositionKey( _
+            StoreCell(data, rowIndex, cols, "HedgeSource"), _
+            StoreCell(data, rowIndex, cols, "CoverageSourceRow"), _
+            StoreCell(data, rowIndex, cols, "ContractCode"), _
+            StoreCell(data, rowIndex, cols, "LinkedISIN"))
+
+    End Select
+
+End Function
+
+
+Private Function StoreCell( _
+    ByVal data As Variant, _
+    ByVal rowIndex As Long, _
+    ByVal cols As Object, _
+    ByVal fieldName As String) As Variant
+
+    If Not cols.Exists(fieldName) Then Exit Function
+
+    StoreCell = data(rowIndex, cols(fieldName))
+
+End Function
+
+
+' Field name -> column index, for one PnlPositionsForStore array.
+Private Function StoreColumnIndex(ByVal data As Variant) As Object
+
+    Dim d As Object
+    Dim j As Long
+    Dim nm As String
+
+    Set d = CreateObject("Scripting.Dictionary")
+    d.CompareMode = 1
+
+    For j = LBound(data, 2) To UBound(data, 2)
+        nm = Trim$(CStr(data(LBound(data, 1), j)))
+        If Len(nm) > 0 Then
+            If Not d.Exists(nm) Then d.Add nm, j
+        End If
+    Next j
+
+    Set StoreColumnIndex = d
+
+End Function
+
+
+Public Function StoreArrayRowCount(ByVal data As Variant) As Long
+
+    If IsEmpty(data) Then Exit Function
+    If Not IsArray(data) Then Exit Function
+
+    On Error GoTo NoRows
+    StoreArrayRowCount = UBound(data, 1) - LBound(data, 1)
+    On Error GoTo 0
+
+    If StoreArrayRowCount < 0 Then StoreArrayRowCount = 0
+    Exit Function
+
+NoRows:
+    StoreArrayRowCount = 0
+
+End Function
+
+
+' Every position key of one kind, in sheet order.
+Public Function StoreKeysOf(ByVal kind As String, ByVal data As Variant) As Variant
+
+    Dim cols As Object
+    Dim keys() As String
+    Dim n As Long
+    Dim i As Long
+
+    n = StoreArrayRowCount(data)
+
+    If n = 0 Then
+        StoreKeysOf = Array()
+        Exit Function
+    End If
+
+    Set cols = StoreColumnIndex(data)
+    ReDim keys(1 To n)
+
+    For i = 1 To n
+        keys(i) = StoreKeyForRow(kind, data, LBound(data, 1) + i, cols)
+    Next i
+
+    StoreKeysOf = keys
+
+End Function
+
+
+' UTC, so runs from machines in different offsets sort against each other.
+' Falls back to local time if WMI is unavailable, which is better than
+' refusing to save.
+Private Function StoreUtcNow() As Date
+
+    Dim wmi As Object
+    Dim items As Object
+    Dim item As Object
+    Dim offsetMinutes As Long
+
+    StoreUtcNow = Now
+
+    On Error GoTo Local_
+
+    Set wmi = GetObject("winmgmts:\\.\root\cimv2")
+    Set items = wmi.ExecQuery("SELECT * FROM Win32_TimeZone")
+
+    For Each item In items
+        offsetMinutes = CLng(item.Bias)
+        Exit For
+    Next item
+
+    StoreUtcNow = DateAdd("n", -offsetMinutes, Now)
+    Exit Function
+
+Local_:
+    StoreUtcNow = Now
+
+End Function
+
+
+Private Function StoreUserName() As String
+
+    On Error Resume Next
+    StoreUserName = Environ$("USERNAME")
+    If Len(StoreUserName) = 0 Then StoreUserName = Application.UserName
+    Err.Clear
+    On Error GoTo 0
+
+End Function
+
+
+Private Function StoreNewIssueLog() As Object
+    Set StoreNewIssueLog = CreateObject("Scripting.Dictionary")
+End Function
+
+
+Private Sub StoreAddIssue( _
+    ByVal issues As Object, _
+    ByVal severity As String, _
+    ByVal tableName As String, _
+    ByVal key As String, _
+    ByVal srcRow As Variant, _
+    ByVal detail As String)
+
+    If issues.Count >= ST_MAX_ISSUES Then Exit Sub
+
+    issues(issues.Count) = Array(severity, tableName, key, srcRow, detail)
+
+End Sub
+
+
+' =============================================================================
+' NUMBERS ACROSS A LOCALE
+'
+' The one thing a CSV store gets wrong quietly.  The desk runs Excel in
+' Portuguese, where the decimal separator is a COMMA - so CStr(1234.56) is
+' "1234,56", the writer sees a comma and dutifully quotes the field, and the
+' reader hands back the four-character text "1234,56" instead of a number.  The
+' file is well-formed, the round trip "works", and every DV01 in the restored
+' book is text that sums to zero.
+'
+' So numbers are written with Str$ and read with Val, both of which are
+' invariant: they only ever speak ".".  Nothing here goes through the machine's
+' regional settings in either direction, which also means a run saved on one
+' desk restores identically on another.
+' =============================================================================
+
+Public Function StoreNumberText(ByVal v As Variant) As String
+
+    Dim s As String
+
+    ' Str$ prefixes a space for positives and drops the leading zero of a
+    ' fraction: 0.5 comes out " .5".  Both are cosmetic here, but ".5" is not a
+    ' number to every tool that might read these files.
+    s = Trim$(Str$(v))
+
+    If Left$(s, 1) = "." Then
+        s = "0" & s
+    ElseIf Left$(s, 2) = "-." Then
+        s = "-0" & Mid$(s, 2)
+    End If
+
+    StoreNumberText = s
+
+End Function
+
+
+' Is this text exactly what StoreNumberText writes?
+'
+' Strict on purpose.  Anything looser turns identifiers into numbers, and the
+' padded ones are the danger: OPICS portfolios and coverage rows arrive as
+' "0012" and "007", and a restore that loads them as 12 and 7 matches no key at
+' all - a hedge disappears with no error anywhere.
+Public Function StoreLooksNumeric(ByVal s As String) As Boolean
+
+    Dim i As Long
+    Dim ch As String
+    Dim digits As Long
+    Dim intDigits As Long
+    Dim seenDot As Boolean
+    Dim seenExp As Boolean
+
+    If Len(s) = 0 Then Exit Function
+    If s <> Trim$(s) Then Exit Function
+
+    i = 1
+    If Left$(s, 1) = "-" Then i = 2
+
+    Do While i <= Len(s)
+
+        ch = Mid$(s, i, 1)
+
+        If ch >= "0" And ch <= "9" Then
+            digits = digits + 1
+            If Not seenDot And Not seenExp Then intDigits = intDigits + 1
+
+        ElseIf ch = "." Then
+            If seenDot Or seenExp Then Exit Function
+            seenDot = True
+
+        ElseIf ch = "E" Or ch = "e" Then
+            If seenExp Or digits = 0 Then Exit Function
+            seenExp = True
+            If Mid$(s, i + 1, 1) = "+" Or Mid$(s, i + 1, 1) = "-" Then i = i + 1
+            If i >= Len(s) Then Exit Function
+
+        Else
+            Exit Function
+
+        End If
+
+        i = i + 1
+
+    Loop
+
+    If digits = 0 Then Exit Function
+
+    ' A leading zero on a multi-digit whole part is padding, not arithmetic.
+    If intDigits > 1 Then
+        If Mid$(s, IIf(Left$(s, 1) = "-", 2, 1), 1) = "0" Then Exit Function
+    End If
+
+    StoreLooksNumeric = True
+
+End Function
+
+
+' One CSV field back to the value the sheet held.
+Public Function StoreTypedValue(ByVal s As String) As Variant
+
+    If Len(s) = 0 Then
+        StoreTypedValue = ""
+
+    ElseIf s = "TRUE" Then
+        StoreTypedValue = True
+
+    ElseIf s = "FALSE" Then
+        StoreTypedValue = False
+
+    ElseIf StoreLooksNumeric(s) Then
+        StoreTypedValue = Val(s)
+
+    Else
+        StoreTypedValue = s
+
+    End If
+
+End Function
+
+
+' A whole parsed file, typed.
+'
+' Row 0 is the header and stays text: a column called "3M" is a name, not the
+' number 3.
+Public Function StoreTypeArray(ByVal data As Variant) As Variant
+
+    Dim outv() As Variant
+    Dim i As Long
+    Dim j As Long
+
+    If IsEmpty(data) Then Exit Function
+    If Not IsArray(data) Then Exit Function
+
+    ReDim outv(LBound(data, 1) To UBound(data, 1), _
+               LBound(data, 2) To UBound(data, 2))
+
+    For i = LBound(data, 1) To UBound(data, 1)
+        For j = LBound(data, 2) To UBound(data, 2)
+            If i = LBound(data, 1) Then
+                outv(i, j) = CStr(data(i, j))
+            Else
+                outv(i, j) = StoreTypedValue(CStr(data(i, j)))
+            End If
+        Next j
+    Next i
+
+    StoreTypeArray = outv
+
+End Function
+
+
+' =============================================================================
+' WHAT A RUN FOLDER HOLDS
+'
+' Sheet name -> file name.  One list, so the writer and the reader cannot
+' disagree about what a snapshot contains, and adding a sheet is one entry.
+' =============================================================================
+
+Private Function StoreSnapshotSheets() As Variant
+    StoreSnapshotSheets = Array( _
+        "Bonds|Bonds.csv", _
+        "Swaps|Swaps.csv", _
+        "Futures|Futures.csv", _
+        "PNL_Attribution|PNL_Attribution.csv", _
+        "OIS_Curves|OIS_Curves.csv", _
+        "SpreadOverride|SpreadOverride.csv", _
+        "FutMap|FutMap.csv")
+End Function
+
+
+
+' The Config cells a run depends on.  Addresses, not a range, because they are
+' scattered and because naming each one says what it is for.
+Private Function StoreConfigCells() As Variant
+    StoreConfigCells = Array( _
+        "B4|AsOfTM1", _
+        "B5|AsOfT0", _
+        "B18|SpreadFrameworkFallback", _
+        "B20|LastLoad", _
+        "B21|BondCount", _
+        "B22|SwapCount", _
+        "B23|FutureCount", _
+        "B24|LastMarketDataRefresh", _
+        "B27|BaseCCY", _
+        "B31|YearsLeftBasis", _
+        "B36|ConvexityBumpBp")
+End Function
+
+
+' =============================================================================
+' SAVING A RUN
+'
+' The order is the order of what can still be undone:
+'
+'   1  read the three position sheets and build every key
+'   2  fingerprint them, and stop here if the latest run holds the same set
+'   3  create the folder
+'   4  write every file
+'   5  and only then record the run on Config
+'
+' Nothing is created until the duplicate check has passed.  A failure part-way
+' leaves a folder with fewer files in it than it should have, which the
+' manifest's absence makes visible - run.csv is written LAST for that reason.
+' =============================================================================
+
+Public Function Store_SaveCurrentRun( _
+    Optional ByVal silent As Boolean = False, _
+    Optional ByVal notes As String = "") As String
+
+    Dim bonds As Variant
+    Dim swaps As Variant
+    Dim futures As Variant
+    Dim fingerprint As String
+    Dim priorRun As String
+    Dim folder As String
+    Dim issues As Object
+    Dim asOf As Variant
+    Dim spec As Variant
+    Dim parts As Variant
+    Dim data As Variant
+    Dim i As Long
+    Dim msg As String
+    Dim errText As String
+    Dim counts(0 To 2) As Long
+
+    bonds = PnlPositionsForStore(STORE_KIND_BOND)
+    swaps = PnlPositionsForStore(STORE_KIND_SWAP)
+    futures = PnlPositionsForStore(STORE_KIND_FUTURE)
+
+    counts(0) = StoreArrayRowCount(bonds)
+    counts(1) = StoreArrayRowCount(swaps)
+    counts(2) = StoreArrayRowCount(futures)
+
+    If counts(0) = 0 And counts(1) = 0 And counts(2) = 0 Then
+        StoreSetStatus "Nothing to save - Bonds, Swaps and Futures are empty."
+        If Not silent Then
+            MsgBox "There are no positions on Bonds, Swaps or Futures, so " & _
+                   "there is nothing to store.", vbExclamation, "Run store"
+        End If
+        Exit Function
+    End If
+
+    fingerprint = StoreRunFingerprint(bonds, swaps, futures)
+    asOf = PnlAsOfDates()
+
+    On Error GoTo SaveFail
+
+    priorRun = StoreRunWithFingerprint(fingerprint, asOf(0))
+
+    If Len(priorRun) > 0 Then
+        StoreSetStatus "Unchanged since " & StoreFolderLeaf(priorRun) & _
+                       " - not saved again."
+        If Not silent Then
+            MsgBox "These are exactly the positions already stored in " & _
+                   StoreFolderLeaf(priorRun) & " for the same reporting " & _
+                   "date, so nothing was written." & vbCrLf & vbCrLf & _
+                   "Load new positions first, or delete that folder if it " & _
+                   "should be replaced.", vbInformation, "Run store"
+        End If
+        Store_SaveCurrentRun = priorRun
+        Exit Function
+    End If
+
+    ' --- 3. the folder ------------------------------------------------------
+    If Not StoreEnsureFolder(StoreRunsRoot()) Then
+        Err.Raise vbObjectError + 3100, , _
+            "Could not create the runs folder: " & StoreRunsRoot()
+    End If
+
+    folder = StoreRunsRoot() & Application.PathSeparator & _
+             StoreRunFolderName(StoreUtcNow())
+
+    If Not StoreEnsureFolder(folder) Then
+        Err.Raise vbObjectError + 3101, , _
+            "Could not create the run folder: " & folder
+    End If
+
+    ' --- 4. the files -------------------------------------------------------
+    Set issues = StoreNewIssueLog()
+
+    StoreCheckDuplicates "BOND", bonds, issues
+    StoreCheckDuplicates "SWAP", swaps, issues
+    StoreCheckDuplicates "FUTURE", futures, issues
+
+    spec = StoreSnapshotSheets()
+
+    For i = LBound(spec) To UBound(spec)
+        parts = Split(CStr(spec(i)), "|")
+        data = PnlSheetSnapshot(CStr(parts(0)))
+        If Not IsEmpty(data) Then
+            StoreWriteCsv folder & Application.PathSeparator & CStr(parts(1)), data
+        Else
+            StoreAddIssue issues, "WARN", CStr(parts(0)), "", Empty, _
+                "sheet missing or empty - not written"
+        End If
+    Next i
+
+    StoreWriteCsv folder & Application.PathSeparator & ST_FILE_CONFIG, _
+                  StoreConfigSnapshot()
+
+    StoreWriteCsv folder & Application.PathSeparator & ST_FILE_ISSUES, _
+                  StoreIssueTable(issues)
+
+    ' run.csv LAST.  Its absence is what marks a folder whose write did not
+    ' finish, and StoreRunWithFingerprint ignores any folder without one.
+    StoreWriteCsv folder & Application.PathSeparator & ST_FILE_RUN, _
+                  StoreManifest(fingerprint, asOf, counts, issues.Count, notes)
+
+    ' --- 5. record it -------------------------------------------------------
+    StoreSetLastRun StoreFolderLeaf(folder)
+
+    msg = StoreFolderLeaf(folder) & ": " & CStr(counts(0)) & " bonds, " & _
+          CStr(counts(1)) & " swaps, " & CStr(counts(2)) & " futures" & _
+          IIf(issues.Count = 0, "", ", " & CStr(issues.Count) & " issue(s)")
+    StoreSetStatus msg
+
+    Store_SaveCurrentRun = folder
+
+    If Not silent Then
+        MsgBox msg & vbCrLf & vbCrLf & folder & _
+               IIf(issues.Count = 0, "", vbCrLf & vbCrLf & _
+                   "See Run_Issue.csv for what was refused."), _
+               IIf(issues.Count = 0, vbInformation, vbExclamation), _
+               "Run store"
+    End If
+
+    Exit Function
+
+SaveFail:
+    ' Read Err FIRST: StoreSetStatus traps internally and resets it.
+    errText = Err.Description
+    StoreSetStatus "Save FAILED: " & errText
+
+    If Not silent Then
+        MsgBox "Saving the run failed." & vbCrLf & vbCrLf & errText, _
+               vbCritical, "Run store"
+    End If
+
+End Function
+
+
+' Everything the run holds, as one string.  The counts are in it as well as the
+' keys, so a run that LOST a position cannot fingerprint the same as one that
+' never had it.
+Private Function StoreRunFingerprint( _
+    ByVal bonds As Variant, _
+    ByVal swaps As Variant, _
+    ByVal futures As Variant) As String
+
+    StoreRunFingerprint = _
+        StoreFingerprintOfKeys(StoreKeysOf("BOND", bonds)) & "-" & _
+        StoreFingerprintOfKeys(StoreKeysOf("SWAP", swaps)) & "-" & _
+        StoreFingerprintOfKeys(StoreKeysOf("FUTURE", futures)) & "-" & _
+        StoreHash32(CStr(StoreArrayRowCount(bonds)) & "/" & _
+                    CStr(StoreArrayRowCount(swaps)) & "/" & _
+                    CStr(StoreArrayRowCount(futures)))
+
+
+End Function
+
+
+' The latest run holding this fingerprint for this reporting date, or "".
+'
+' Only the LATEST is checked, not every run ever stored: the guard exists to
+' stop pressing the button twice in a row producing two identical folders, and
+' a book that legitimately returns to an earlier state is a run worth keeping.
+Private Function StoreRunWithFingerprint( _
+    ByVal fingerprint As String, _
+    ByVal asOfT0 As Variant) As String
+
+    Dim folder As String
+    Dim manifest As Variant
+    Dim storedFp As String
+    Dim storedT0 As String
+
+    folder = StoreLatestRunFolder()
+    If Len(folder) = 0 Then Exit Function
+
+    manifest = StoreReadCsv(folder & Application.PathSeparator & ST_FILE_RUN)
+    If IsEmpty(manifest) Then Exit Function
+
+    storedFp = StoreManifestValue(manifest, "RunFingerprint")
+    storedT0 = StoreManifestValue(manifest, "AsOfT0")
+
+    If storedFp <> fingerprint Then Exit Function
+    If storedT0 <> StoreDateText(asOfT0) Then Exit Function
+
+    StoreRunWithFingerprint = folder
+
+End Function
+
+
+' Walk the positions once, recording what a second occurrence of a key would
+' have been.  The dictionary names WHICH row was refused and the row it
+' duplicated; without it the issue log could only say that a duplicate existed.
+Private Sub StoreCheckDuplicates( _
+    ByVal kind As String, _
+    ByVal data As Variant, _
+    ByVal issues As Object)
+
+    Dim cols As Object
+    Dim seen As Object
+    Dim n As Long
+    Dim i As Long
+    Dim key As String
+    Dim srcRow As Variant
+
+    n = StoreArrayRowCount(data)
+    If n = 0 Then Exit Sub
+
+    Set cols = StoreColumnIndex(data)
+    Set seen = CreateObject("Scripting.Dictionary")
+    seen.CompareMode = 0
+
+    For i = 1 To n
+
+        key = StoreKeyForRow(kind, data, LBound(data, 1) + i, cols)
+        srcRow = StoreCell(data, LBound(data, 1) + i, cols, "SourceRow")
+
+        If Len(key) = 0 Then
+            StoreAddIssue issues, "WARN", kind, key, srcRow, _
+                "row has no identifying fields"
+        ElseIf Len(key) > ST_MAX_KEY_LEN Then
+            StoreAddIssue issues, "ERROR", kind, key, srcRow, _
+                "position key is " & CStr(Len(key)) & " characters, over " & _
+                CStr(ST_MAX_KEY_LEN)
+        ElseIf seen.Exists(key) Then
+            StoreAddIssue issues, "WARN", kind, key, srcRow, _
+                "duplicate of the row from sheet row " & CStr(seen(key))
+        Else
+            seen(key) = srcRow
+        End If
+
+    Next i
+
+End Sub
+
+
+' =============================================================================
+' THE MANIFEST, THE ISSUE TABLE AND THE CONFIG SNAPSHOT
+'
+' All three are ordinary two-column CSVs.  There is no JSON anywhere: VBA has
+' no parser for it, a hand-rolled one is a classic source of quiet bugs, and
+' every one of these is flat key/value or a plain table - which CSV says
+' perfectly well and Excel opens by double-clicking.
+' =============================================================================
+
+Private Function StoreManifest( _
+    ByVal fingerprint As String, _
+    ByVal asOf As Variant, _
+    ByRef counts() As Long, _
+    ByVal issueCount As Long, _
+    ByVal notes As String) As Variant
+
+    Dim rows As Variant
+    Dim outv() As Variant
+    Dim parts As Variant
+    Dim i As Long
+
+    rows = Array( _
+        "RunStartedUtc|" & StoreDateText(StoreUtcNow()), _
+        "AsOfT0|" & StoreDateText(asOf(0)), _
+        "AsOfTM1|" & StoreDateText(asOf(1)), _
+        "RunBy|" & StoreUserName(), _
+        "ModuleVersion|" & ST_VERSION, _
+        "RunFingerprint|" & fingerprint, _
+        "BondCount|" & Trim$(Str$(counts(0))), _
+        "SwapCount|" & Trim$(Str$(counts(1))), _
+        "FutureCount|" & Trim$(Str$(counts(2))), _
+        "IssueCount|" & Trim$(Str$(issueCount)), _
+        "Notes|" & notes)
+
+    ReDim outv(0 To UBound(rows) + 1, 0 To 1)
+    outv(0, 0) = "Key"
+    outv(0, 1) = "Value"
+
+    For i = LBound(rows) To UBound(rows)
+        parts = Split(CStr(rows(i)), "|", 2)
+        outv(i + 1, 0) = parts(0)
+        outv(i + 1, 1) = parts(1)
+    Next i
+
+    StoreManifest = outv
+
+End Function
+
+
+Private Function StoreManifestValue( _
+    ByVal manifest As Variant, _
+    ByVal key As String) As String
+
+    Dim i As Long
+
+    If IsEmpty(manifest) Then Exit Function
+
+    For i = LBound(manifest, 1) To UBound(manifest, 1)
+        If StrComp(CStr(manifest(i, 0)), key, vbTextCompare) = 0 Then
+            StoreManifestValue = CStr(manifest(i, 1))
+            Exit Function
+        End If
+    Next i
+
+End Function
+
+
+' A date as an unambiguous, sortable string.
+'
+' Built from the parts rather than through Format$, whose separators follow the
+' machine: two desks on different regional settings would otherwise write dates
+' that do not compare equal, and the duplicate-run guard compares them as text.
+Public Function StoreDateText(ByVal v As Variant) As String
+
+    Dim d As Date
+
+    If IsNull(v) Or IsEmpty(v) Then Exit Function
+    If IsError(v) Then Exit Function
+    If Len(Trim$(CStr(v))) = 0 Then Exit Function
+    If Not IsDate(v) Then Exit Function
+
+    d = CDate(v)
+
+    StoreDateText = StorePad(Year(d), 4) & "-" & StorePad(Month(d), 2) & "-" & _
+                    StorePad(Day(d), 2) & " " & StorePad(Hour(d), 2) & ":" & _
+                    StorePad(Minute(d), 2) & ":" & StorePad(Second(d), 2)
+
+End Function
+
+
+Private Function StoreIssueTable(ByVal issues As Object) As Variant
+
+    Dim outv() As Variant
+    Dim k As Variant
+    Dim it As Variant
+    Dim i As Long
+
+    ReDim outv(0 To issues.Count, 0 To 4)
+    outv(0, 0) = "Severity"
+    outv(0, 1) = "Kind"
+    outv(0, 2) = "PositionKey"
+    outv(0, 3) = "SourceRow"
+    outv(0, 4) = "Detail"
+
+    i = 1
+    For Each k In issues.keys
+        it = issues(k)
+        outv(i, 0) = it(0)
+        outv(i, 1) = it(1)
+        ' The key is joined with Chr(11), which no reader wants to see.
+        outv(i, 2) = Replace(CStr(it(2)), ST_KEY_SEP, " | ")
+        outv(i, 3) = it(3)
+        outv(i, 4) = it(4)
+        i = i + 1
+    Next k
+
+    StoreIssueTable = outv
+
+End Function
+
+
+Private Function StoreConfigSnapshot() As Variant
+
+    Dim ws As Worksheet
+    Dim spec As Variant
+    Dim outv() As Variant
+    Dim parts As Variant
+    Dim i As Long
+
+    spec = StoreConfigCells()
+
+    ReDim outv(0 To UBound(spec) + 1, 0 To 2)
+    outv(0, 0) = "Cell"
+    outv(0, 1) = "Name"
+    outv(0, 2) = "Value"
+
+    On Error Resume Next
+    Set ws = ThisWorkbook.Worksheets(ST_SH_CONFIG)
+    On Error GoTo 0
+
+    For i = LBound(spec) To UBound(spec)
+        parts = Split(CStr(spec(i)), "|")
+        outv(i + 1, 0) = parts(0)
+        outv(i + 1, 1) = parts(1)
+        If Not ws Is Nothing Then outv(i + 1, 2) = ws.Range(CStr(parts(0))).value
+    Next i
+
+    StoreConfigSnapshot = outv
+
+End Function
+
+
+Private Function StoreFolderLeaf(ByVal path As String) As String
+
+    Dim p As Long
+
+    p = InStrRev(path, Application.PathSeparator)
+
+    If p > 0 Then
+        StoreFolderLeaf = Mid$(path, p + 1)
+    Else
+        StoreFolderLeaf = path
+    End If
+
+End Function
+
+
+' =============================================================================
+' LOADING A RUN
+'
+' Writes VALUES over the formulas on every snapshot sheet, then republishes the
+' Dashboard's column names at the loaded row count.
+'
+' The sheets stop being live after this, and that is the point: a restored run
+' that recalculates is no longer the run that was stored.  Press the run button
+' to go back to a live book.
+' =============================================================================
+
+Public Function Store_LoadRun( _
+    ByVal folder As String, _
+    Optional ByVal silent As Boolean = False) As Long
+
+    Dim spec As Variant
+    Dim parts As Variant
+    Dim data As Variant
+    Dim path As String
+    Dim i As Long
+    Dim loaded As Long
+    Dim pnlRows As Long
+    Dim missing As String
+    Dim oldCalc As XlCalculation
+    Dim oldScreen As Boolean
+    Dim errText As String
+
+    If Len(folder) = 0 Then Exit Function
+
+    oldCalc = Application.Calculation
+    oldScreen = Application.ScreenUpdating
+
+    On Error GoTo LoadFail
+
+    Application.ScreenUpdating = False
+    Application.Calculation = xlCalculationManual
+
+    spec = StoreSnapshotSheets()
+
+    For i = LBound(spec) To UBound(spec)
+
+        parts = Split(CStr(spec(i)), "|")
+        path = folder & Application.PathSeparator & CStr(parts(1))
+
+        If Len(Dir$(path)) = 0 Then
+            missing = missing & vbCrLf & "  " & CStr(parts(1))
+        Else
+            ' Typed here, not in the parser: the parser's job is text in and
+            ' text out, and its tests pin it that way.  What a sheet needs is
+            ' the value - a DV01 restored as the text "1234.56" looks right in
+            ' the cell and sums to nothing.
+            data = StoreTypeArray(StoreReadCsv(path))
+            loaded = PnlRestoreSheet(CStr(parts(0)), data)
+            If CStr(parts(0)) = "PNL_Attribution" Then pnlRows = loaded
+        End If
+
+    Next i
+
+    ' Without this the Dashboard's names still span the PREVIOUS run's row
+    ' count and DashKeyCol raises 9901 - or worse, spans further than the data
+    ' and sums whatever the clear left behind.
+    PnlPublishNamesForRows pnlRows
+
+    Application.Calculation = oldCalc
+    Application.ScreenUpdating = oldScreen
+
+    StoreSetLastRun StoreFolderLeaf(folder)
+    StoreSetStatus "Loaded " & StoreFolderLeaf(folder) & " - " & _
+                   CStr(pnlRows) & " attribution row(s)."
+
+    Store_LoadRun = pnlRows
+
+    If Not silent Then
+        MsgBox StoreFolderLeaf(folder) & " is on the sheets." & vbCrLf & _
+               vbCrLf & CStr(pnlRows) & " attribution rows." & vbCrLf & _
+               vbCrLf & "These are the STORED values, not live formulas - " & _
+               "nothing was asked of Bloomberg or OPICS. Press the run " & _
+               "button to go back to a live book." & _
+               IIf(Len(missing) = 0, "", vbCrLf & vbCrLf & _
+                   "Files not in this folder:" & missing), _
+               IIf(Len(missing) = 0, vbInformation, vbExclamation), _
+               "Run store"
+    End If
+
+    Exit Function
+
+LoadFail:
+    errText = Err.Description
+    Application.Calculation = oldCalc
+    Application.ScreenUpdating = oldScreen
+    StoreSetStatus "Load FAILED: " & errText
+    If Not silent Then
+        MsgBox "Loading " & folder & " failed:" & vbCrLf & vbCrLf & errText, _
+               vbCritical, "Run store"
+    End If
+
+End Function
+
+
+' =============================================================================
+' THE TWO BUTTONS
+'
+'   1  Store_RunAndSave           load the hedges, attribute, save the run
+'   2  Store_LoadLatestAndBuild   put the latest run on the sheets, build the
+'                                 Dashboard from it
+'
+' They live HERE rather than in modPNL, and that is the whole point of the
+' arrangement: modStore calls into modPNL and modDashboard, and neither calls
+' back.  The previous store put two calls into modPNL's buttons, which made an
+' optional module a hard requirement - importing the four modules anyone
+' actually needs left the project uncompilable, naming a module nobody had
+' asked for.
+' =============================================================================
+
+Public Sub Store_RunAndSave()
+
+    Dim folder As String
+
+    Application.StatusBar = "Run: loading hedges and attributing..."
+    Button2_LoadHedgesAndAttribute
+
+    Application.StatusBar = "Run: saving the snapshot..."
+    folder = Store_SaveCurrentRun(silent:=True, notes:="Store_RunAndSave")
+
+    Application.StatusBar = False
+
+    If Len(folder) = 0 Then
+        MsgBox "The run finished but nothing was stored." & vbCrLf & vbCrLf & _
+               StoreStatusText(), vbExclamation, "Run store"
+    Else
+        MsgBox "Run complete and stored." & vbCrLf & vbCrLf & _
+               StoreStatusText() & vbCrLf & vbCrLf & folder & vbCrLf & _
+               vbCrLf & "Next: the Dashboard button.", _
+               vbInformation, "Run store"
+    End If
+
+End Sub
+
+
+Public Sub Store_LoadLatestAndBuild()
+
+    Dim folder As String
+
+    folder = StoreLatestRunFolder()
+
+    If Len(folder) = 0 Then
+        MsgBox "There are no stored runs under" & vbCrLf & vbCrLf & _
+               StoreRunsRoot() & vbCrLf & vbCrLf & _
+               "Press the run button first.", vbExclamation, "Run store"
+        Exit Sub
+    End If
+
+    Store_LoadRun folder, silent:=True
+
+    Application.StatusBar = "Building the Dashboard from " & _
+                            StoreFolderLeaf(folder) & "..."
+    BuildDashboard_Step6
+    Application.StatusBar = False
+
+    MsgBox "Dashboard built from " & StoreFolderLeaf(folder) & "." & vbCrLf & _
+           vbCrLf & "The sheets hold the STORED values for that run - " & _
+           "nothing was asked of Bloomberg or OPICS.", _
+           vbInformation, "Run store"
+
+End Sub
+
+
+' =============================================================================
+' THE REST OF THE BUTTONS
+' =============================================================================
+
+Public Sub Store_ShowRunHistory()
+
+    Dim ws As Worksheet
+    Dim folders As Variant
+    Dim manifest As Variant
+    Dim root As String
+    Dim i As Long
+    Dim r As Long
+
+    root = StoreRunsRoot()
+    folders = StoreAllRunFolders()
+
+    Set ws = StoreHistorySheet()
+    ws.Cells.ClearContents
+
+    ws.Range("A1").value = "Stored runs - " & root
+    ws.Range("A1").Font.Bold = True
+
+    ws.Range("A3").Resize(1, 8).value = Array( _
+        "Run", "AsOfT0", "AsOfTM1", "By", "Bonds", "Swaps", "Futures", "Issues")
+    ws.Range("A3").Resize(1, 8).Font.Bold = True
+
+    r = 4
+
+    ' Newest first, which is the order anyone reads a run list in.
+    For i = UBound(folders) To LBound(folders) Step -1
+
+        manifest = StoreReadCsv(root & Application.PathSeparator & _
+                                CStr(folders(i)) & Application.PathSeparator & _
+                                ST_FILE_RUN)
+
+        ws.Cells(r, 1).value = CStr(folders(i))
+        ws.Cells(r, 2).value = StoreManifestValue(manifest, "AsOfT0")
+        ws.Cells(r, 3).value = StoreManifestValue(manifest, "AsOfTM1")
+        ws.Cells(r, 4).value = StoreManifestValue(manifest, "RunBy")
+        ws.Cells(r, 5).value = StoreManifestValue(manifest, "BondCount")
+        ws.Cells(r, 6).value = StoreManifestValue(manifest, "SwapCount")
+        ws.Cells(r, 7).value = StoreManifestValue(manifest, "FutureCount")
+        ws.Cells(r, 8).value = StoreManifestValue(manifest, "IssueCount")
+
+        ' A folder with no run.csv is one whose write did not finish.
+        If IsEmpty(manifest) Then
+            ws.Cells(r, 2).value = "(incomplete - no run.csv)"
+        End If
+
+        r = r + 1
+
+    Next i
+
+    ws.Columns("A:H").AutoFit
+    ws.Activate
+
+    StoreSetStatus CStr(r - 4) & " run(s) listed."
+
+End Sub
+
+
+Public Sub Store_LoadRunByName()
+
+    Dim answer As String
+    Dim folder As String
+
+    answer = InputBox( _
+        "Which run should be loaded onto the sheets?" & vbCrLf & vbCrLf & _
+        "Run Store_ShowRunHistory first if you need the list." & vbCrLf & _
+        vbCrLf & "This REPLACES what is on Bonds, Swaps, Futures, " & _
+        "PNL_Attribution and OIS_Curves.", _
+        "Load a stored run", StoreLastRunName())
+
+    If Len(Trim$(answer)) = 0 Then Exit Sub
+
+    folder = StoreRunsRoot() & Application.PathSeparator & Trim$(answer)
+
+    If Len(Dir$(folder, vbDirectory)) = 0 Then
+        MsgBox "There is no folder" & vbCrLf & vbCrLf & folder, _
+               vbExclamation, "Run store"
+        Exit Sub
+    End If
+
+    Store_LoadRun folder
+
+End Sub
+
+
+Public Sub Store_OpenRunsFolder()
+
+    Dim root As String
+
+    root = StoreRunsRoot()
+
+    If Len(Dir$(root, vbDirectory)) = 0 Then
+        MsgBox "There are no stored runs yet." & vbCrLf & vbCrLf & root, _
+               vbInformation, "Run store"
+        Exit Sub
+    End If
+
+    Shell "explorer.exe """ & root & """", vbNormalFocus
+
+End Sub
+
+
+' Creates the folder and reports what is there.  The equivalent of the old
+' connection test, and much shorter, because there is nothing to connect to.
+Public Sub Store_TestStore()
+
+    Dim root As String
+    Dim folders As Variant
+    Dim latest As String
+
+    root = StoreRunsRoot()
+
+    If Not StoreEnsureFolder(root) Then
+        MsgBox "Could not create the runs folder:" & vbCrLf & vbCrLf & root & _
+               vbCrLf & vbCrLf & "Check the folder is writable.", _
+               vbCritical, "Run store"
+        Exit Sub
+    End If
+
+    folders = StoreAllRunFolders()
+    latest = StoreLatestRunFolder()
+
+    MsgBox "Run store is ready." & vbCrLf & vbCrLf & _
+           "Folder:  " & root & vbCrLf & _
+           "Runs:    " & CStr(UBound(folders) - LBound(folders) + 1) & vbCrLf & _
+           "Latest:  " & IIf(Len(latest) = 0, "(none yet)", _
+                             StoreFolderLeaf(latest)) & vbCrLf & vbCrLf & _
+           "Nothing needs installing: the store is CSV files, written and " & _
+           "read by this module.", _
+           vbInformation, "Run store"
+
+End Sub
+
+
+' =============================================================================
+' CONFIG
+' =============================================================================
+
+Private Function StoreConfigSheet() As Worksheet
+    On Error Resume Next
+    Set StoreConfigSheet = ThisWorkbook.Worksheets(ST_SH_CONFIG)
+    Err.Clear
+    On Error GoTo 0
+End Function
+
+
+Private Function StoreHistorySheet() As Worksheet
+
+    Dim ws As Worksheet
+
+    On Error Resume Next
+    Set ws = ThisWorkbook.Worksheets(ST_SH_HISTORY)
+    On Error GoTo 0
+
+    If ws Is Nothing Then
+        Set ws = ThisWorkbook.Worksheets.Add( _
+            After:=ThisWorkbook.Worksheets(ThisWorkbook.Worksheets.Count))
+        ws.name = ST_SH_HISTORY
+    End If
+
+    Set StoreHistorySheet = ws
+
+End Function
+
+
+Private Function StoreLastRunName() As String
+
+    Dim ws As Worksheet
+
+    Set ws = StoreConfigSheet()
+    If ws Is Nothing Then Exit Function
+
+    StoreLastRunName = Trim$(CStr(ws.Range(ST_CFG_LAST_RUN).value))
+
+End Function
+
+
+Private Sub StoreSetLastRun(ByVal runName As String)
+
+    Dim ws As Worksheet
+
+    Set ws = StoreConfigSheet()
+    If ws Is Nothing Then Exit Sub
+
+    ws.Range(ST_CFG_LAST_RUN).value = runName
+
+End Sub
+
+
+Private Function StoreStatusText() As String
+
+    Dim ws As Worksheet
+
+    Set ws = StoreConfigSheet()
+    If ws Is Nothing Then Exit Function
+
+    StoreStatusText = CStr(ws.Range(ST_CFG_STATUS).value)
+
+End Function
+
+
+Private Sub StoreSetStatus(ByVal msg As String)
+
+    Dim ws As Worksheet
+
+    Set ws = StoreConfigSheet()
+    If ws Is Nothing Then Exit Sub
+
+    ws.Range(ST_CFG_STATUS).value = _
+        StoreDateText(Now) & "  " & msg
+
+End Sub
+
+
+' Label the cells this module owns.  Called from Store_TestStore, so the labels
+' appear the first time anyone touches the store - and NOT from modPNL's
+' layout setup, which is what made the previous store a compile-time
+' requirement of a module that has no business knowing it exists.
+Public Sub Store_SetupConfigCells()
+
+    Dim ws As Worksheet
+
+    Set ws = StoreConfigSheet()
+    If ws Is Nothing Then Exit Sub
+
+    ws.Range("A41").value = "Run store folder (blank = PNL_Runs beside this workbook)"
+    ws.Range("A42").value = "Save every run automatically (TRUE/FALSE)"
+    ws.Range("A43").value = "Last run saved or loaded (auto - do not edit)"
+    ws.Range("A44").value = "Last store message (auto - do not edit)"
+    ws.Range("A45").value = "(unused - every run is kept)"
+
+    If Len(Trim$(CStr(ws.Range(ST_CFG_AUTOSAVE).value))) = 0 Then
+        ws.Range(ST_CFG_AUTOSAVE).value = "TRUE"
+    End If
+
+End Sub

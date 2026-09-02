@@ -1,0 +1,30 @@
+sheet             BLOOMBERG      QUERY        UDF  AGGREGATE    DERIVED  UNWRITTEN   total
+-----------------------------------------------------------------------------------------
+Bonds                    17         11         22                    30          9      89
+Futures                  10         18                     1         11          2      42
+OIS_Curves               18          9         12                     3          4      46
+PNL_Attribution                                 7         13         65          1      86
+Swaps                    11         18          5                    30          3      67
+-----------------------------------------------------------------------------------------
+                         56         56         46         14        139         19     330
+
+  fetched  (Excel or a query must do it):  112
+  computed (can move to Access):           199
+  unwritten (declared, nothing fills it):   19
+
+  20 Bloomberg write(s) target a HARD-CODED column letter, not a constant:
+      WriteCurveT0BQLFormulas -> WriteBQLDown_T0(... , "AA")
+      WriteCurveT0BQLFormulas -> WriteBQLDown_T0(... , "AL")
+      WriteCurveT0BQLFormulas -> WriteBQLDown_T0(... , "AO")
+      WriteCurveT0BQLFormulas -> WriteBQLDown_T0(... , "AR")
+      WriteCurveT0BQLFormulas -> WriteBQLDown_T0(... , "D")
+      WriteCurveT0BQLFormulas -> WriteBQLDown_T0(... , "G")
+      WriteCurveT0BQLFormulas -> WriteBQLDown_T0(... , "J")
+      WriteCurveT0BQLFormulas -> WriteBQLDown_T0(... , "U")
+      WriteCurveT0BQLFormulas -> WriteBQLDown_T0(... , "X")
+      WriteCurves_T1_BDP_Efficient -> WriteBDPCell_Efficient(... , "AP")
+      WriteCurves_T1_BDP_Efficient -> WriteBDPCell_Efficient(... , "H")
+      WriteCurves_T1_BDP_Efficient -> WriteBDPDown_Efficient(... , "AB")
+      ... and 8 more
+      The XCOL_ constants beside them claim to be the contract;
+      moving one of those columns would not move the pull.

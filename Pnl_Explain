@@ -1,0 +1,3284 @@
+Option Explicit
+
+
+' =============================================================================
+' PNL Explainer BiG - HEDGE LOAD
+'
+' This module does ONE job, and it is now the only macro the workbook needs:
+' Load_Hedges.
+'
+' It reads the desk's two coverage books, works out what each hedge covers,
+' writes the mapping columns of the Futures and Swaps sheets, and stamps the
+' coverage links back onto Bonds!SwapLink / Bonds!FutLink.
+'
+' -----------------------------------------------------------------------------
+' THREE RULES
+'
+' 1) IT DOES NOT FORMAT ANYTHING.
+'
+'    No font, colour, alignment, column width, ClearFormats or NumberFormat
+'    write remains, and none may be added.  The workbook's appearance is the
+'    desk's, not the macro's.
+'
+'    This also used to be a stability problem, not just a taste one:
+'    AppendSwapMapRowsToSwaps set NumberFormat = "@" across a quarter of a
+'    million mostly-empty cells on every run, which pinned UsedRange at row
+'    50,004 for ever and made each subsequent "clear" a 50,000-row operation.
+'    Text-sensitive identifiers are written with a leading apostrophe instead
+'    (see TextSafe), which costs nothing and touches no cell format.
+'
+' 2) IT DOES NOT WRITE HEADERS, AND IT DOES NOT WRITE FORMULAS.
+'
+'    Row 4 is CHECKED against the layout this module compiles against, and a
+'    mismatch stops the run before anything is touched - see
+'    AssertHedgeSheetHeaders.  Where the load adds rows past the end of an
+'    existing formula block, FillFormulaColumnsDown replicates the formula the
+'    column ALREADY has, in R1C1 form, onto the new rows only.  The macro never
+'    authors a formula and never overwrites one.
+'
+' 3) IT WRITES ONLY THE COLUMNS IT OWNS.
+'
+'    FuturesOwnedColumns and SwapsOwnedColumns are the whole list.  Everything
+'    else on those two sheets belongs to the formulas the desk put there.  The
+'    previous build cleared and rewrote the full sheet width on every run,
+'    which destroyed every BDP and BQL formula on Futures and Swaps - including
+'    Swaps!O (DV01 BBG) and the entire BQL block, the numbers the attribution
+'    is built on.
+' -----------------------------------------------------------------------------
+'
+' WHAT WAS FIXED IN THIS BUILD
+'
+' The column constants below had drifted from the sheets - by one column on
+' Futures, one on the Bonds link columns, and TEN on Swaps after that sheet
+' gained DV01 BBG plus a BQL block at O:X.  Seventy-three constants were wrong.
+' Nothing errored; the load simply wrote to the wrong cells:
+'
+'   - Hedge_Source and Hedge_Class landed on Coverage_BPV and Link_Source, so
+'     PNL_Attribution's filters on AM="RTJ" and AO="RATES" matched nothing and
+'     every futures hedge summed to zero;
+'   - the swap mapping block landed across O:AD, on top of live market data;
+'   - Bonds!SwapLink landed on FutLink and FutLink on BBG_Cand_ISIN, corrupting
+'     a bond pricing input.
+'
+' Futures!Hedge_Class and Swaps!FloatCurve_Type were also DECLARED and never
+' written, which zeroed the futures hedge and silently zeroed the swap curve
+' model independently of the shift above.
+'
+' The header assertion exists so that this class of failure can only ever
+' produce a message, never a wrong number.
+'
+' -----------------------------------------------------------------------------
+'
+' OPICS IS GONE.  The database was only ever asked for exchange, face value,
+' delivery, CTD and average entry price for the futures, plus PayFixed for the
+' swaps.  Four of those are already Bloomberg formulas on the Futures sheet;
+' the other two are properties of the contract root and are now a table.  See
+' "FUTURES CONTRACT SPECIFICATION".
+'
+' See docs/ARCHITECTURE.md for how the pieces fit and docs/COLUMNS.md for the
+' sheet contracts.
+' =============================================================================
+
+
+' =============================================================================
+' CONFIG CELLS
+' =============================================================================
+Private Const CFG_T0_DATE          As String = "B4"
+Private Const CFG_T1_DATE          As String = "B5"
+Private Const CFG_AUTO_DATE        As String = "B6"    ' "AUTO" -> derive the dates
+Private Const CFG_SWAP_CNT         As String = "B22"
+Private Const CFG_FUT_CNT          As String = "B23"
+
+
+' =============================================================================
+' SHEET NAMES
+' =============================================================================
+Private Const SH_CONFIG  As String = "Config"
+Private Const SH_BONDS   As String = "Bonds"
+Private Const SH_SWAPS   As String = "Swaps"
+Private Const SH_FUTURES As String = "Futures"
+Private Const SH_SWAPMAP As String = "SwapMap"
+Private Const SH_COV_SUPPORT       As String = "Coverage support"
+Private Const SH_COV_FUTURES       As String = "CoverageFutures"
+Private Const SH_COV_TOTAL_SUPPORT As String = "Coverage Total support"
+
+
+' =============================================================================
+' THE TWO COVERAGE BOOKS
+'
+' The desk's hedges are split across two files with DIFFERENT Resumo layouts.
+' Every geometry difference between them is a named constant below, and each
+' book is read by its own pass, so a change to one cannot silently move the
+' other.  Loading only one of them makes every bond hedged out of the other
+' read as UNHEDGED.
+'
+' What the two books have in common is the COVERAGE RELATION - the desk calls
+' it #RC.  See "COVERAGE RELATION (#RC) -> BOND" below: it is the join, and
+' getting it wrong is what dropped hedges off bonds.
+' =============================================================================
+
+
+' --- Book 1: Hedge_Risco Tx Juro (interest-rate hedges) ----------------------
+'
+'   A       the coverage INSTRUMENT label   ("OE1 #163"), or a swap-row marker
+'   B       #RC, the coverage relation
+'   C       ISIN of the element being covered
+'   D       coverage info
+'   H       instrument type ("Plain Vanilla Swap", a future, ...)
+'   I:K     plain-vanilla swap Bloomberg ids   direct / fixed leg / float leg
+'   L       accounting classification, filtered on HtC&S
+'   M       counterparty
+'   O       notional (or contract count for a future)
+'   P       start date
+'   Q       end date
+'   T       currency
+'   AC:AE   synthetic swap Bloomberg ids       direct / fixed leg / float leg
+'   AF      synthetic notional
+'   AI      synthetic end date
+'
+' Rows 9..220 are scanned in full: the block is not contiguous.
+Private Const SWAP_ID_BOOK_PATH  As String = "M:\P_Pires\TRADING\Hedge_Risco Tx Juro.xlsm"
+Private Const SWAP_ID_BOOK_SHEET As String = "Resumo"
+Private Const SWAP_ID_FIRST_ROW  As Long = 9
+Private Const SWAP_ID_LAST_ROW   As Long = 220
+Private Const HEDGE_RISCO_COPY_LAST_COL      As String = "AI"
+Private Const HEDGE_RISCO_FORMULA_A_COL      As String = "AJ"
+Private Const HEDGE_RISCO_PORTFOLIO_TYPE_COL As String = "L"
+
+Private Const RTJ_RC_COL        As String = "B"    ' #RC, the coverage relation
+Private Const RTJ_ISIN_COL      As String = "C"    ' covered element's ISIN
+Private Const RTJ_INFO_COL      As String = "D"
+Private Const RTJ_TYPE_COL      As String = "H"
+Private Const RTJ_CPTY_COL      As String = "M"
+Private Const RTJ_NOTIONAL_COL  As String = "O"
+Private Const RTJ_STARTDATE_COL As String = "P"
+Private Const RTJ_ENDDATE_COL   As String = "Q"
+Private Const RTJ_CCY_COL       As String = "T"
+Private Const RTJ_PLAIN_DIRECT_COL As String = "I"
+Private Const RTJ_PLAIN_FIXED_COL  As String = "J"
+Private Const RTJ_PLAIN_FLOAT_COL  As String = "K"
+Private Const RTJ_SYNTH_DIRECT_COL   As String = "AC"
+Private Const RTJ_SYNTH_FIXED_COL    As String = "AD"
+Private Const RTJ_SYNTH_FLOAT_COL    As String = "AE"
+Private Const RTJ_SYNTH_NOTIONAL_COL As String = "AF"
+Private Const RTJ_SYNTH_ENDDATE_COL  As String = "AI"
+
+
+' --- Book 2: Hedge_Risco Total (everything else) -----------------------------
+'
+'   A       #RC, the coverage relation
+'   B:K     the element being COVERED    B ISIN, C name, D maturity,
+'           E notional, F bpv, G start px, H px now, I MtM, J p/d, K net
+'   L:W     the instrument of COVERAGE   L type, M accounting class,
+'           N counterparty, O years, P notional, Q start date, R ccy,
+'           S bpv, T MtM, U accrued, V daily, W net
+'
+' Rows 8..34 are scanned in full because the block is NOT contiguous - blank
+' rows sit between groups, so stopping at the first empty row would silently
+' drop everything below it.  The header row is inside that range and is
+' rejected by the HtC&S filter like any other non-qualifying row.
+'
+' Note how little this shares with book 1: the #RC is in a different column,
+' the covered ISIN is in a different column, and the accounting classification
+' this filters on is in M here and in L there.  If a load returns zero rows,
+' these are the first cells to check against the file.
+Private Const HEDGE_TOTAL_BOOK_PATH  As String = "M:\P_Pires\TRADING\Hedge_Risco Total.xlsm"
+Private Const HEDGE_TOTAL_BOOK_SHEET As String = "Resumo"
+Private Const HEDGE_TOTAL_FIRST_ROW  As Long = 8
+Private Const HEDGE_TOTAL_LAST_ROW   As Long = 34
+Private Const HEDGE_TOTAL_COPY_LAST_COL As String = "W"
+Private Const HEDGE_TOTAL_FORMULA_A_COL As String = "X"
+
+Private Const RT_RC_COL             As String = "A"   ' #RC, the coverage relation
+Private Const RT_ISIN_COL           As String = "B"   ' covered element's ISIN
+Private Const HEDGE_TOTAL_PORTFOLIO_TYPE_COL As String = "M"
+Private Const HEDGE_TOTAL_TYPE_COL         As String = "L"
+Private Const HEDGE_TOTAL_COUNTERPARTY_COL As String = "N"
+Private Const HEDGE_TOTAL_NOTIONAL_COL     As String = "P"
+Private Const HEDGE_TOTAL_STARTDATE_COL    As String = "Q"
+Private Const HEDGE_TOTAL_CCY_COL          As String = "R"
+Private Const HEDGE_TOTAL_BPV_COL          As String = "S"
+
+
+' Which coverage file a hedge row came from.  These two strings are the join
+' key behind the FuturesRTJ / FuturesRT split on PNL_Attribution, and they
+' also scope the #RC index: an "#RC 12" in one book is NOT the same relation
+' as an "#RC 12" in the other, so the two indexes are separate objects.
+Private Const HEDGE_SOURCE_RTJ As String = "RTJ"   ' Hedge_Risco Tx Juro.xlsm
+Private Const HEDGE_SOURCE_RT  As String = "RT"    ' Hedge_Risco Total.xlsm
+
+
+' Futures!Hedge_Class.  These two strings are a contract, not labels:
+' PNL_Attribution filters Futures RTJ/RT (BPVs) and Futures_Match_Count on
+' "RATES", and modDashboard splits its FX view on "FX".  Changing either string
+' silently zeroes whatever was filtered on it.
+Private Const HEDGE_CLASS_RATES As String = "RATES"
+Private Const HEDGE_CLASS_FX    As String = "FX"
+
+
+' How a hedge row's covered bond was decided.  Written to the map sheets and to
+' Futures/Swaps so the desk can see which route each row took rather than
+' having to guess from the result.
+Private Const LINK_SRC_RC        As String = "RC"          ' from the relation; row carried no ISIN
+Private Const LINK_SRC_RC_AGREE  As String = "RC=ROW"      ' relation and row agreed
+Private Const LINK_SRC_RC_WINS   As String = "RC<>ROW"     ' they disagreed; the relation won
+Private Const LINK_SRC_ROW       As String = "ROW"         ' relation unknown; fell back to the row
+Private Const LINK_SRC_AMBIGUOUS As String = "RC_AMBIGUOUS" ' one relation, several ISINs
+Private Const LINK_SRC_NONE      As String = "NONE"        ' nothing to link to
+
+' Sentinel parked in the #RC index when one relation names more than one ISIN.
+Private Const RC_AMBIGUOUS As String = "*AMBIGUOUS*"
+
+
+' =============================================================================
+' SHEET GEOMETRY
+' =============================================================================
+
+
+' Bonds!1..2 are reserved for the desk's comments, so the header is row 3 and
+' the first bond is row 4.  This module does not own the Bonds layout - it only
+' reads column A and writes the two link columns - but it has to agree with it.
+Private Const BOND_HEADER_ROW As Long = 3
+Private Const BOND_DATA_ROW   As Long = 4
+
+' Futures, Swaps, SwapMap and CoverageFutures all put their header on row 4 and
+' their first position on row 5.
+Private Const DATA_ROW        As Long = 5
+Private Const FUT_HEADER_ROW  As Long = 4
+Private Const SWAP_HEADER_ROW As Long = 4
+Private Const MAP_HEADER_ROW  As Long = 4
+
+' Pure runaway guard: a corrupt source must not be able to drive a write loop
+' for a million rows.  Never a capacity limit - if a real run approaches it,
+' raise it rather than truncating positions.
+Private Const MAX_SHEET_ROWS As Long = 50000
+
+' How far past today's data a clear reaches, so rows left by a LARGER previous
+' run are removed.
+'
+' This used to be taken from ws.UsedRange, which is a property of FORMATTING as
+' much as of content.  One stray NumberFormat on row 50,000 - which this module
+' used to write on every run - made UsedRange say 50,004 for ever, so every
+' clear became a 50,000-row operation and the button appeared to hang or took
+' Excel down outright.  A fixed lookahead is bounded, deterministic, and cannot
+' be poisoned by a format.
+Private Const CLEAR_LOOKAHEAD_ROWS As Long = 200
+
+' =============================================================================
+' COLUMN CONSTANTS  (one letter-string per sheet column; single source of truth)
+'
+'   Address builders use these directly:  ws.Range(FCOL_CTD_ISIN & r)
+'   colNum(FCOL_x) converts a column letter to its number where one is needed.
+'   To move a column, edit ONLY its constant here.
+' =============================================================================
+
+
+' --- Bonds columns: the THREE this module touches ----------------------------
+'
+' Deliberately not the whole Bonds contract.  Nothing here loads bonds any more;
+' this module reads the ISIN to find a bond's row and writes the two coverage
+' link columns back onto it.  Declaring the other 88 columns would claim an
+' ownership this module does not have.
+'
+' These three were one column to the RIGHT of the real sheet until this build.
+' SwapLink was written into FutLink, and FutLink into BBG_Cand_ISIN - a bond
+' PRICING input - so every run silently destroyed the Bloomberg candidate
+' ticker for every bond that carried a futures hedge.
+Private Const BCOL_ISIN     As String = "A"    ' col 1  = ISIN
+Private Const BCOL_SWAPLINK As String = "BQ"   ' col 69 = SwapLink
+Private Const BCOL_FUTLINK  As String = "BR"   ' col 70 = FutLink
+
+
+' --- Futures columns (42) ---
+'
+' There is no ConvFactor column on this sheet.  This block used to declare one
+' at AA, which put EVERY column from AA onward one place to the right of where
+' it actually lives.  The two that matter are Hedge_Source and Hedge_Class:
+' PNL_Attribution filters futures on AM="RTJ"/"RT" and AO="RATES", and the
+' loader was writing those two values into AN (Coverage_BPV) and AP
+' (Link_Source).  Neither filter ever matched, so every futures hedge summed to
+' zero and every hedged bond read as unhedged.
+Private Const FCOL_CONTRACTCODE As String = "A"   ' col 1 = ContractCode
+Private Const FCOL_EXCHANGE As String = "B"   ' col 2 = Exchange
+Private Const FCOL_CCY As String = "C"   ' col 3 = CCY
+Private Const FCOL_CONTRACTS As String = "D"   ' col 4 = Contracts
+Private Const FCOL_FACEVALUE As String = "E"   ' col 5 = FaceValue
+Private Const FCOL_DELIVDATE As String = "F"   ' col 6 = DelivDate
+Private Const FCOL_CTD_ISIN As String = "G"   ' col 7 = CTD_ISIN
+Private Const FCOL_CTD_CF As String = "H"   ' col 8 = CTD_CF
+Private Const FCOL_PORTFOLIO As String = "I"   ' col 9 = Portfolio
+Private Const FCOL_LINKEDISIN As String = "J"   ' col 10 = LinkedISIN
+Private Const FCOL_AVGENTRYPX As String = "K"   ' col 11 = AvgEntryPx
+Private Const FCOL_DAYSTODELIV As String = "L"   ' col 12 = DaysToDeliv
+Private Const FCOL_FX_T0 As String = "M"   ' col 13 = FX_T0
+Private Const FCOL_FUTPX_T0 As String = "N"   ' col 14 = FutPx_T0
+Private Const FCOL_CTD_DIRTYPX_T0 As String = "O"   ' col 15 = CTD_DirtyPx_T0
+Private Const FCOL_CTD_TICKER_TM1 As String = "P"   ' col 16 = CTD_Ticker_T-1
+Private Const FCOL_FUTPX_TM1 As String = "Q"   ' col 17 = FutPx_T-1
+Private Const FCOL_IMPLIEDREPO_CALC As String = "R"   ' col 18 = ImpliedRepo_Calc
+Private Const FCOL_GROSSBASIS_CALC As String = "S"   ' col 19 = GrossBasis_Calc
+Private Const FCOL_NOTIONALVALUE_EUR As String = "T"   ' col 20 = NotionalValue_EUR
+Private Const FCOL_FUTURESPNL_EUR As String = "U"   ' col 21 = FuturesPnL_EUR
+Private Const FCOL_BBG_TICKER As String = "V"   ' col 22 = BBG_Ticker
+Private Const FCOL_STATUS_T0 As String = "W"   ' col 23 = Status_T0
+Private Const FCOL_STATUS_TM1 As String = "X"   ' col 24 = Status_T-1
+Private Const FCOL_FUT_VAL_PT As String = "Y"   ' col 25 = FUT_VAL_PT
+Private Const FCOL_CTD_TICKER As String = "Z"   ' col 26 = CTD_Ticker
+Private Const FCOL_HEDGEUNITDV01 As String = "AA"   ' col 27 = HedgeUnitDV01
+Private Const FCOL_FUTURES_DV01_EUR As String = "AB"   ' col 28 = Futures_DV01_EUR
+Private Const FCOL_IMPLIEDREPO_BBG As String = "AC"   ' col 29 = ImpliedRepo_BBG
+Private Const FCOL_NETBASIS_BBG As String = "AD"   ' col 30 = NetBasis_BBG
+Private Const FCOL_GROSSBASIS_BBG As String = "AE"   ' col 31 = GrossBasis_BBG
+Private Const FCOL_STATUS As String = "AF"   ' col 32 = Status
+Private Const FCOL_COVERAGE_SOURCEROW As String = "AG"   ' col 33 = Coverage_SourceRow
+Private Const FCOL_COVERAGERELATION As String = "AH"   ' col 34 = CoverageRelation
+Private Const FCOL_FUTURELABEL As String = "AI"   ' col 35 = FutureLabel
+Private Const FCOL_HEDGETYPE As String = "AJ"   ' col 36 = HedgeType
+Private Const FCOL_COVERAGE_STARTDATE As String = "AK"   ' col 37 = Coverage_StartDate
+Private Const FCOL_COVERAGEINFO_D As String = "AL"   ' col 38 = CoverageInfo_D
+Private Const FCOL_HEDGE_SOURCE As String = "AM"   ' col 39 = Hedge_Source
+Private Const FCOL_COVERAGE_BPV As String = "AN"   ' col 40 = Coverage_BPV
+Private Const FCOL_HEDGE_CLASS As String = "AO"   ' col 41 = Hedge_Class
+' How this row's LinkedISIN was decided.
+Private Const FCOL_LINK_SOURCE As String = "AP"   ' col 42 = Link_Source
+
+
+' --- Swaps columns (78) ---
+'
+' This block was the pre-insert map, ten columns short.  The sheet has since
+' gained DV01 BBG plus a nine-column BQL block at O:X, which pushed OIS_T0 and
+' everything after it out to Y:BZ.  Two consequences, both silent:
+'
+'   Swap_ID_Source - the PLAIN/SYNTHETIC tag every attribution SUMIFS filters
+'   on - was written to AG, which on the real sheet is "PV_T-1 da anuidade".
+'   No filter matched, so every swap hedge summed to zero.
+'
+'   The map block landed across O:AD, ON TOP of the live DV01 BBG, BQL, OIS,
+'   DF, Annuity and FX columns.  The loader was overwriting market data with
+'   mapping text on every run.
+'
+' The BQL block appears TWICE on the sheet - once at P:X and again at BA:BI.
+' The second is a duplicate the desk kept; it is declared here as WCOL_DUP_*
+' so that a future edit cannot mistake one for the other.
+Private Const WCOL_DEALID As String = "A"   ' col 1 = DealID
+Private Const WCOL_CCY As String = "B"   ' col 2 = Ccy
+Private Const WCOL_NOTIONAL As String = "C"   ' col 3 = Notional
+Private Const WCOL_FIXEDRATE As String = "D"   ' col 4 = FixedRate
+Private Const WCOL_FLOATINDEX As String = "E"   ' col 5 = FloatIndex
+Private Const WCOL_FLOATSPREAD As String = "F"   ' col 6 = FloatSpread
+Private Const WCOL_STARTDATE As String = "G"   ' col 7 = StartDate
+Private Const WCOL_ENDDATE As String = "H"   ' col 8 = EndDate
+Private Const WCOL_PAYFIXED As String = "I"   ' col 9 = PayFixed
+Private Const WCOL_PORTFOLIO As String = "J"   ' col 10 = Portfolio
+Private Const WCOL_FLOATCURVE_TYPE As String = "K"   ' col 11 = FloatCurve_Type
+Private Const WCOL_LINKEDISIN As String = "L"   ' col 12 = LinkedISIN
+Private Const WCOL_CPTY As String = "M"   ' col 13 = Cpty
+Private Const WCOL_YEARFRAC As String = "N"   ' col 14 = YearFrac
+Private Const WCOL_DV01_BBG As String = "O"   ' col 15 = DV01 BBG
+Private Const WCOL_BQL_NPV_DIRECT_T0 As String = "P"   ' col 16 = BQL_NPV_Direct_T0
+Private Const WCOL_BQL_NPV_FIXED_T0 As String = "Q"   ' col 17 = BQL_NPV_Fixed_T0
+Private Const WCOL_BQL_NPV_FLOAT_T0 As String = "R"   ' col 18 = BQL_NPV_Float_T0
+Private Const WCOL_BQL_NPV_TOTAL_T0 As String = "S"   ' col 19 = BQL_NPV_Total_T0
+Private Const WCOL_BQL_NPV_DIRECT_TM1 As String = "T"   ' col 20 = BQL_NPV_Direct_T-1
+Private Const WCOL_BQL_NPV_FIXED_TM1 As String = "U"   ' col 21 = BQL_NPV_Fixed_T-1
+Private Const WCOL_BQL_NPV_FLOAT_TM1 As String = "V"   ' col 22 = BQL_NPV_Float_T-1
+Private Const WCOL_BQL_NPV_TOTAL_TM1 As String = "W"   ' col 23 = BQL_NPV_Total_T-1
+Private Const WCOL_BQL_SWAP_PNL As String = "X"   ' col 24 = BQL_Swap_PnL
+Private Const WCOL_OIS_T0 As String = "Y"   ' col 25 = OIS_T0
+Private Const WCOL_OIS_TM1 As String = "Z"   ' col 26 = OIS_T-1
+Private Const WCOL_DF_T0 As String = "AA"   ' col 27 = DF_T0
+Private Const WCOL_DF_TM1 As String = "AB"   ' col 28 = DF_T-1
+Private Const WCOL_ANNUITY_T0 As String = "AC"   ' col 29 = Annuity_T0
+Private Const WCOL_ANNUITY_TM1 As String = "AD"   ' col 30 = Annuity_T-1
+Private Const WCOL_FX As String = "AE"   ' col 31 = FX
+Private Const WCOL_PV_T0_MODEL As String = "AF"   ' col 32 = PV_T0 da anuidade
+Private Const WCOL_PV_TM1_MODEL As String = "AG"   ' col 33 = PV_T-1 da anuidade
+Private Const WCOL_SWAP_DV01_EUR As String = "AH"   ' col 34 = Swap_DV01 Calculated In house
+Private Const WCOL_MODEL_PNL As String = "AI"   ' col 35 = Model_PnL
+Private Const WCOL_STATUS As String = "AJ"   ' col 36 = Status
+Private Const WCOL_PNL_SOURCE As String = "AK"   ' col 37 = PnL_Source
+Private Const WCOL_PNL As String = "AL"   ' col 38 = PnL
+Private Const WCOL_AF_STATUS As String = "AM"   ' col 39 = AF_Status
+Private Const WCOL_BBG_SWAP_DIRECT_ID As String = "AN"   ' col 40 = BBG_Swap_Direct_ID
+Private Const WCOL_BBG_FIXED_LEG_ID As String = "AO"   ' col 41 = BBG_Fixed_Leg_ID
+Private Const WCOL_BBG_FLOAT_LEG_ID As String = "AP"   ' col 42 = BBG_Float_Leg_ID
+Private Const WCOL_SWAP_ID_SOURCE As String = "AQ"   ' col 43 = Swap_ID_Source
+Private Const WCOL_COVERAGERELATION As String = "AR"   ' col 44 = CoverageRelation
+Private Const WCOL_SWAPMAP_SOURCEROW As String = "AS"   ' col 45 = SwapMap_SourceRow
+Private Const WCOL_SWAPMAP_CLASS As String = "AT"   ' col 46 = SwapMap_Class
+Private Const WCOL_SWAPMAP_STATUS As String = "AU"   ' col 47 = SwapMap_Status
+Private Const WCOL_MAP_NOTIONAL As String = "AV"   ' col 48 = Map_Notional
+Private Const WCOL_MAP_CCY As String = "AW"   ' col 49 = Map_CCY
+Private Const WCOL_MAP_COUNTERPARTY As String = "AX"   ' col 50 = Map_Counterparty
+Private Const WCOL_NOTIONAL_FINAL As String = "AY"   ' col 51 = Notional_Final
+Private Const WCOL_NOTIONAL_SOURCE As String = "AZ"   ' col 52 = Notional_Source
+Private Const WCOL_DUP_BQL_NPV_DIRECT_T0 As String = "BA"   ' col 53 = BQL_NPV_Direct_T0 (dup)
+Private Const WCOL_DUP_BQL_NPV_FIXED_T0 As String = "BB"   ' col 54 = BQL_NPV_Fixed_T0 (dup)
+Private Const WCOL_DUP_BQL_NPV_FLOAT_T0 As String = "BC"   ' col 55 = BQL_NPV_Float_T0 (dup)
+Private Const WCOL_DUP_BQL_NPV_TOTAL_T0 As String = "BD"   ' col 56 = BQL_NPV_Total_T0 (dup)
+Private Const WCOL_DUP_BQL_NPV_DIRECT_TM1 As String = "BE"   ' col 57 = BQL_NPV_Direct_T-1 (dup)
+Private Const WCOL_DUP_BQL_NPV_FIXED_TM1 As String = "BF"   ' col 58 = BQL_NPV_Fixed_T-1 (dup)
+Private Const WCOL_DUP_BQL_NPV_FLOAT_TM1 As String = "BG"   ' col 59 = BQL_NPV_Float_T-1 (dup)
+Private Const WCOL_DUP_BQL_NPV_TOTAL_TM1 As String = "BH"   ' col 60 = BQL_NPV_Total_T-1 (dup)
+Private Const WCOL_DUP_BQL_SWAP_PNL As String = "BI"   ' col 61 = BQL_Swap_PnL (dup)
+Private Const WCOL_BQL_SWAP_STATUS As String = "BJ"   ' col 62 = BQL_Swap_Status
+Private Const WCOL_PAY_FLT_RATE_IDX As String = "BK"   ' col 63 = PAY_FLT_RATE_IDX
+Private Const WCOL_FLOATINDEX_FAMILY As String = "BL"   ' col 64 = FloatIndex_Family
+Private Const WCOL_FLOATINDEX_TENOR As String = "BM"   ' col 65 = FloatIndex_Tenor
+Private Const WCOL_FLOATCURVE_T0 As String = "BN"   ' col 66 = FloatCurve_T0
+Private Const WCOL_FLOATCURVE_TM1 As String = "BO"   ' col 67 = FloatCurve_T-1
+Private Const WCOL_MODELSPREAD_T0 As String = "BP"   ' col 68 = ModelSpread_T0
+Private Const WCOL_MODELSPREAD_TM1 As String = "BQ"   ' col 69 = ModelSpread_T-1
+Private Const WCOL_DELTA_FLOATCURVE_BP As String = "BR"   ' col 70 = Delta_FloatCurve_bp
+Private Const WCOL_DELTA_MODELSPREAD_BP As String = "BS"   ' col 71 = Delta_ModelSpread_bp
+Private Const WCOL_RESERVED_1 As String = "BT"   ' col 72 = Reserved_1
+Private Const WCOL_RESERVED_2 As String = "BU"   ' col 73 = Reserved_2
+Private Const WCOL_RESERVED_3 As String = "BV"   ' col 74 = Reserved_3
+Private Const WCOL_RESERVED_4 As String = "BW"   ' col 75 = Reserved_4
+Private Const WCOL_SWAP_DV01_EUR_THEO As String = "BX"   ' col 76 = Swap_DV01_EUR_Theoretical
+Private Const WCOL_FLOATFAMILY_STATUS As String = "BY"   ' col 77 = FloatFamily_Status
+Private Const WCOL_LINK_SOURCE As String = "BZ"   ' col 78 = Link_Source
+
+
+' --- SwapMap (support) columns ---
+Private Const SMCOL_SOURCEROW As String = "A"   ' col 1 = SourceRow
+Private Const SMCOL_COVERAGERELATION As String = "B"   ' col 2 = CoverageRelation
+Private Const SMCOL_LINKEDISIN As String = "C"   ' col 3 = LinkedISIN
+Private Const SMCOL_SWAP_ID_SOURCE As String = "D"   ' col 4 = Swap_ID_Source
+Private Const SMCOL_SWAP_DIRECT_ID As String = "E"   ' col 5 = Swap_Direct_ID
+Private Const SMCOL_FIXED_LEG_ID As String = "F"   ' col 6 = Fixed_Leg_ID
+Private Const SMCOL_FLOAT_LEG_ID As String = "G"   ' col 7 = Float_Leg_ID
+Private Const SMCOL_IMPORTSTATUS As String = "H"   ' col 8 = ImportStatus
+Private Const SMCOL_COUNTERPARTY As String = "I"   ' col 9 = Counterparty
+Private Const SMCOL_NOTIONAL As String = "J"   ' col 10 = Notional
+Private Const SMCOL_STARTDATE As String = "K"   ' col 11 = StartDate
+Private Const SMCOL_ENDDATE As String = "L"   ' col 12 = EndDate
+Private Const SMCOL_CCY As String = "M"   ' col 13 = CCY
+Private Const SMCOL_NOTIONAL_SOURCE As String = "N"   ' col 14 = Notional_Source
+Private Const SMCOL_RC_KEY As String = "O"   ' col 15 = RC_Key
+Private Const SMCOL_LINK_SOURCE As String = "P"   ' col 16 = Link_Source
+
+
+' --- CoverageFutures (support) columns ---
+Private Const CFCOL_SOURCEROW As String = "A"   ' col 1 = SourceRow
+Private Const CFCOL_COVERAGERELATION As String = "B"   ' col 2 = CoverageRelation
+Private Const CFCOL_LINKEDISIN As String = "C"   ' col 3 = LinkedISIN
+Private Const CFCOL_COVERAGEINFO_D As String = "D"   ' col 4 = CoverageInfo_D
+Private Const CFCOL_FUTURELABEL As String = "E"   ' col 5 = FutureLabel
+Private Const CFCOL_FUTURECODE As String = "F"   ' col 6 = FutureCode
+Private Const CFCOL_HEDGETYPE As String = "G"   ' col 7 = HedgeType
+Private Const CFCOL_CONTRACTS As String = "H"   ' col 8 = Contracts
+Private Const CFCOL_STARTDATE As String = "I"   ' col 9 = StartDate
+Private Const CFCOL_CCY As String = "J"   ' col 10 = CCY
+Private Const CFCOL_IMPORTSTATUS As String = "K"   ' col 11 = ImportStatus
+Private Const CFCOL_HEDGE_SOURCE As String = "L"   ' col 12 = Hedge_Source
+Private Const CFCOL_BPV As String = "M"   ' col 13 = Coverage_BPV
+Private Const CFCOL_RC_KEY As String = "N"   ' col 14 = RC_Key
+Private Const CFCOL_LINK_SOURCE As String = "O"   ' col 15 = Link_Source
+
+
+' =============================================================================
+' MODULE STATE
+'
+' Bond link accumulation.  Bonds!SwapLink and Bonds!FutLink used to be written
+' by scanning every bond row for every hedge row - several hundred thousand
+' cell reads and a NumberFormat write per hit.  The links are now accumulated
+' in memory against a one-pass ISIN index and written once per touched row.
+' =============================================================================
+Private mBondRowsByIsin As Object    ' ISIN -> "row,row,..."
+Private mSwapLinkByRow As Object     ' bond row -> CSV of swap ids
+Private mFutLinkByRow As Object      ' bond row -> CSV of contract labels
+
+' Swaps whose floating curve could not be resolved.  Reported at the end: these
+' rows blank Swap_Curve_Model_PnL and so drop their bond out of the headline,
+' which is a thing the desk should be told rather than left to find.
+Private mUnknownCurveCount As Long
+
+
+' =============================================================================
+' COVERAGE RELATION (#RC) -> BOND
+'
+' THE CORRECTION THIS MODULE EXISTS FOR
+'
+' A coverage relation - the desk writes it "#RC" - is the unit of hedging in
+' both Hedge Risco books.  One #RC ties ONE covered element (a bond, named by
+' ISIN) to one or more coverage instruments (futures, swaps).
+'
+' In both books the covered element is written ONCE, on the row that opens the
+' group.  The rows underneath carry only the instrument: their ISIN cell is
+' blank, and in Hedge Risco Total their #RC cell is blank too, because the file
+' is read by a human who can see the group.
+'
+' The old code carried the #RC onto every Futures row and then ignored it: the
+' bond was taken from the instrument row's OWN ISIN cell.  On the first row of
+' a group that works.  On every continuation row the cell is empty, so the row
+' was stamped "Missing LinkedISIN", never linked to a bond, and its risk and
+' PnL disappeared from the attribution - which then read the bond as under- or
+' un-hedged and picked the wrong spread framework for it.
+'
+' The relation is the join.  So:
+'
+'   1) walk each book once and FORWARD-FILL the #RC down its group, resetting
+'      at a genuinely blank row so a fill cannot leak into the next group;
+'   2) register #RC -> ISIN from the rows that DO carry an ISIN;
+'   3) resolve every instrument row's bond through its #RC, falling back to the
+'      row's own ISIN only when the relation has no registered bond.
+'
+' TWO LAYOUTS, TWO INDEXES
+'
+' The books do not share a layout - the #RC is in column B in one and column A
+' in the other, the covered ISIN in C and in B - so each has its own scan with
+' its own column constants.  They also do not share a NUMBERING: "#RC 12" in
+' Tx Juro is a different relation from "#RC 12" in Total.  Merging the two into
+' one index would attach the wrong bond to a hedge whenever both books happened
+' to use the same number, so each book gets its own Dictionary and the two are
+' never consulted together.
+'
+' Every resolution records HOW it was reached (LINK_SRC_*) on the map sheet and
+' on the hedge row, so a wrong link is visible rather than inferred.
+' =============================================================================
+
+
+' The desk writes a relation as "#163", "163", " 163 " or, when the cell is a
+' link into another sheet, as whatever that link returns.  All of those are the
+' same relation and must hash to the same key.
+Private Function NormalizeCoverageRelation(ByVal v As Variant) As String
+
+    Dim s As String
+
+    s = CleanText(v)
+    If Len(s) = 0 Then Exit Function
+
+    Do While Len(s) > 0 And Left$(s, 1) = "#"
+        s = Trim$(Mid$(s, 2))
+    Loop
+
+    ' A relation that is a plain number must not depend on how Excel typed the
+    ' cell: 163, 163.0 and "163" are one relation.
+    If IsNumeric(s) Then
+        If CDbl(s) = Int(CDbl(s)) Then
+            NormalizeCoverageRelation = Format$(CDbl(s), "0")
+            Exit Function
+        End If
+    End If
+
+    Do While InStr(s, "  ") > 0
+        s = Replace(s, "  ", " ")
+    Loop
+
+    NormalizeCoverageRelation = UCase$(s)
+
+End Function
+
+
+' True when a row carries nothing at all, so the #RC fill must stop there
+' rather than run on into the next group.
+Private Function CoverageRowIsBlank( _
+    ByVal ws As Worksheet, _
+    ByVal r As Long, _
+    ByVal lastCol As String) As Boolean
+
+    Dim c As Long
+    Dim lastN As Long
+
+    lastN = colNum(lastCol)
+
+    For c = 1 To lastN
+        If Len(CleanText(ws.Cells(r, c).value)) > 0 Then
+            CoverageRowIsBlank = False
+            Exit Function
+        End If
+    Next c
+
+    CoverageRowIsBlank = True
+
+End Function
+
+
+' One step of the fill, as a pure decision so it can be tested away from a
+' worksheet.  Returns the relation the row belongs to:
+'
+'   a blank row      ""       the fill STOPS - a wholly empty row separates
+'                             groups in both books, and carrying on past it is
+'                             what would credit the last hedge of one relation
+'                             to the next bond down the sheet
+'   a row with an #RC  that #RC   a new group starts
+'   anything else    `current`    a continuation row inherits its group
+Private Function NextCoverageRelation( _
+    ByVal current As String, _
+    ByVal rawRc As String, _
+    ByVal rowIsBlank As Boolean) As String
+
+    If rowIsBlank Then Exit Function
+
+    If Len(rawRc) > 0 Then
+        NextCoverageRelation = rawRc
+    Else
+        NextCoverageRelation = current
+    End If
+
+End Function
+
+
+' Forward-filled #RC for every row of one book, as a Dictionary of row -> key.
+'
+' Separate from the index below because two different passes over the same book
+' (swaps and futures in Tx Juro) must see the SAME fill; recomputing it in each
+' would be two chances to disagree.
+Private Function BuildCoverageRelationByRow( _
+    ByVal ws As Worksheet, _
+    ByVal firstRow As Long, _
+    ByVal lastRow As Long, _
+    ByVal rcCol As String, _
+    ByVal formulaCol As String, _
+    ByVal lastCol As String) As Object
+
+    Dim d As Object
+    Dim r As Long
+    Dim current As String
+    Dim raw As String
+
+    Set d = CreateObject("Scripting.Dictionary")
+
+    For r = firstRow To lastRow
+
+        raw = NormalizeCoverageRelation(ws.Cells(r, rcCol).value)
+
+        ' The relation is often a link into another sheet, so when the cell
+        ' shows nothing the stored formula text is the only record of which
+        ' relation the row belongs to.
+        If Len(raw) = 0 And Len(formulaCol) > 0 Then
+            raw = NormalizeCoverageRelation(ws.Cells(r, formulaCol).value)
+        End If
+
+        current = NextCoverageRelation( _
+            current, raw, CoverageRowIsBlank(ws, r, lastCol))
+
+        d(r) = current
+
+    Next r
+
+    Set BuildCoverageRelationByRow = d
+
+End Function
+
+
+' #RC -> the ISIN that relation covers, for ONE book.
+'
+' A relation naming two different ISINs is a data fault, not something to pick
+' a winner for: it is stored as RC_AMBIGUOUS so every row under it falls back
+' to its own ISIN and says so, rather than half the hedges silently landing on
+' the wrong bond.
+Private Function BuildCoverageRelationIndex( _
+    ByVal ws As Worksheet, _
+    ByVal firstRow As Long, _
+    ByVal lastRow As Long, _
+    ByVal isinCol As String, _
+    ByVal rcByRow As Object) As Object
+
+    Dim d As Object
+    Dim r As Long
+    Dim rc As String
+    Dim isin As String
+
+    Set d = CreateObject("Scripting.Dictionary")
+
+    For r = firstRow To lastRow
+
+        rc = ""
+        If rcByRow.Exists(r) Then rc = CStr(rcByRow(r))
+
+        isin = UCase$(CleanText(ws.Cells(r, isinCol).value))
+
+        If Len(rc) > 0 And Len(isin) > 0 Then
+
+            If Not d.Exists(rc) Then
+                d.Add rc, isin
+            ElseIf d(rc) <> isin Then
+                d(rc) = RC_AMBIGUOUS
+            End If
+
+        End If
+
+    Next r
+
+    Set BuildCoverageRelationIndex = d
+
+End Function
+
+
+' The bond a coverage instrument row hedges.
+'
+' `linkSource` comes back saying which route was taken, so the desk can tell a
+' relation-resolved link from a row-resolved one without re-reading the source
+' book.
+Private Function ResolveCoveredBond( _
+    ByVal rcIndex As Object, _
+    ByVal rcKey As String, _
+    ByVal rowIsin As String, _
+    ByRef linkSource As String) As String
+
+    Dim viaRc As String
+
+    If Len(rcKey) > 0 Then
+        If rcIndex.Exists(rcKey) Then viaRc = CStr(rcIndex(rcKey))
+    End If
+
+    ResolveCoveredBond = ResolveCoveredBondFrom(viaRc, rowIsin, linkSource)
+
+End Function
+
+
+' The decision itself, with the lookup already done.
+'
+' Split from the Dictionary access above so the rule can be exercised directly:
+' this is the whole of the correction, and "the relation wins" is a claim worth
+' being able to prove rather than read.
+Private Function ResolveCoveredBondFrom( _
+    ByVal viaRc As String, _
+    ByVal rowIsin As String, _
+    ByRef linkSource As String) As String
+
+    rowIsin = UCase$(CleanText(rowIsin))
+
+    If Len(viaRc) > 0 And viaRc <> RC_AMBIGUOUS Then
+
+        ResolveCoveredBondFrom = viaRc
+
+        If Len(rowIsin) = 0 Then
+            linkSource = LINK_SRC_RC
+        ElseIf rowIsin = viaRc Then
+            linkSource = LINK_SRC_RC_AGREE
+        Else
+            ' The relation wins.  A continuation row that carries a stale or
+            ' mistyped ISIN is exactly the case this correction is for.
+            linkSource = LINK_SRC_RC_WINS
+        End If
+
+        Exit Function
+
+    End If
+
+    If viaRc = RC_AMBIGUOUS Then
+        ResolveCoveredBondFrom = rowIsin
+        If Len(rowIsin) > 0 Then
+            linkSource = LINK_SRC_AMBIGUOUS
+        Else
+            linkSource = LINK_SRC_NONE
+        End If
+        Exit Function
+    End If
+
+    ResolveCoveredBondFrom = rowIsin
+
+    If Len(rowIsin) > 0 Then
+        linkSource = LINK_SRC_ROW
+    Else
+        linkSource = LINK_SRC_NONE
+    End If
+
+End Function
+
+
+' =============================================================================
+' BOND <-> HEDGE LINKING   (Bonds!BR SwapLink, Bonds!BS FutLink)
+'
+' These two columns are how the desk reads, on the bond row itself, which
+' hedges cover it.  They are the visible half of the coverage relationship, so
+' they have to keep working exactly as before - only now the ISIN they are
+' keyed on is the one the #RC resolved, which means the continuation rows that
+' used to be dropped now appear here too.
+'
+' The old implementation scanned every bond row for every hedge - a few hundred
+' hedges against a few hundred bonds is over a hundred thousand cell reads,
+' each hit also writing a NumberFormat.  It is now one pass to index the bonds
+' by ISIN, an in-memory accumulation, and one write per bond row that actually
+' gained a link.
+' =============================================================================
+
+
+' Index the bonds by ISIN and clear the two link columns.  Call once, before
+' any hedge row is mapped.
+Private Sub BeginBondLinks(ByVal wsBnd As Worksheet)
+
+    Dim lastRow As Long
+    Dim r As Long
+    Dim isin As String
+    Dim vals As Variant
+
+    Set mBondRowsByIsin = CreateObject("Scripting.Dictionary")
+    Set mSwapLinkByRow = CreateObject("Scripting.Dictionary")
+    Set mFutLinkByRow = CreateObject("Scripting.Dictionary")
+
+    lastRow = LastBondDataRow(wsBnd)
+    If lastRow < BOND_DATA_ROW Then Exit Sub
+
+    ' One read for the whole ISIN column rather than one per row.
+    vals = wsBnd.Range(BCOL_ISIN & BOND_DATA_ROW & ":" & BCOL_ISIN & lastRow).value
+
+    For r = BOND_DATA_ROW To lastRow
+
+        If lastRow = BOND_DATA_ROW Then
+            isin = UCase$(CleanText(vals))
+        Else
+            isin = UCase$(CleanText(vals(r - BOND_DATA_ROW + 1, 1)))
+        End If
+
+        If Len(isin) > 0 Then
+            ' The same ISIN can sit on several bond rows (one bond in two
+            ' portfolios).  Every one of them gets the link.
+            If mBondRowsByIsin.Exists(isin) Then
+                mBondRowsByIsin(isin) = mBondRowsByIsin(isin) & "," & CStr(r)
+            Else
+                mBondRowsByIsin.Add isin, CStr(r)
+            End If
+        End If
+
+    Next r
+
+    ' Contents only.  Clearing formats here would take the desk's own
+    ' highlighting off the two columns every time the button ran.
+    wsBnd.Range(BCOL_SWAPLINK & BOND_DATA_ROW & ":" & _
+                BCOL_FUTLINK & lastRow).ClearContents
+
+End Sub
+
+
+' Queue one hedge against one bond.  `isFuture` picks the column.
+Private Sub QueueBondLink( _
+    ByVal isin As String, _
+    ByVal hedgeId As String, _
+    ByVal isFuture As Boolean)
+
+    Dim cleanISIN As String
+    Dim cleanId As String
+    Dim rows As Variant
+    Dim i As Long
+    Dim r As Long
+    Dim target As Object
+
+    If mBondRowsByIsin Is Nothing Then Exit Sub
+
+    cleanISIN = UCase$(CleanText(isin))
+    cleanId = IdText(hedgeId)
+
+    If Len(cleanISIN) = 0 Then Exit Sub
+    If Len(cleanId) = 0 Then Exit Sub
+    If Not mBondRowsByIsin.Exists(cleanISIN) Then Exit Sub
+
+    If isFuture Then
+        Set target = mFutLinkByRow
+    Else
+        Set target = mSwapLinkByRow
+    End If
+
+    rows = Split(CStr(mBondRowsByIsin(cleanISIN)), ",")
+
+    For i = LBound(rows) To UBound(rows)
+
+        r = CLng(rows(i))
+
+        If target.Exists(r) Then
+            target(r) = AppendCsv(CStr(target(r)), cleanId)
+        Else
+            target.Add r, cleanId
+        End If
+
+    Next i
+
+End Sub
+
+
+' Write the accumulated links.  One cell write per bond row that gained one.
+Private Sub FlushBondLinks(ByVal wsBnd As Worksheet)
+
+    Dim k As Variant
+
+    If mSwapLinkByRow Is Nothing Then Exit Sub
+
+    For Each k In mSwapLinkByRow.keys
+        wsBnd.Cells(CLng(k), colNum(BCOL_SWAPLINK)).value = _
+            TextSafe(CStr(mSwapLinkByRow(k)))
+    Next k
+
+    For Each k In mFutLinkByRow.keys
+        wsBnd.Cells(CLng(k), colNum(BCOL_FUTLINK)).value = _
+            TextSafe(CStr(mFutLinkByRow(k)))
+    Next k
+
+End Sub
+
+
+' How many bond rows ended up carrying a link of each kind.  Reported in the
+' completion box: "22 futures rows loaded" and "0 bonds linked" are very
+' different outcomes and used to look identical.
+Private Function BondLinkCount(ByVal isFuture As Boolean) As Long
+
+    If isFuture Then
+        If mFutLinkByRow Is Nothing Then Exit Function
+        BondLinkCount = mFutLinkByRow.Count
+    Else
+        If mSwapLinkByRow Is Nothing Then Exit Function
+        BondLinkCount = mSwapLinkByRow.Count
+    End If
+
+End Function
+
+
+Private Function AppendCsv(ByVal existing As String, ByVal item As String) As String
+
+    Dim e As String
+    Dim x As String
+
+    e = CleanText(existing)
+    x = IdText(item)
+
+    If x = "" Then
+        AppendCsv = e
+        Exit Function
+    End If
+
+    If e = "" Then
+        AppendCsv = x
+    ElseIf InStr(1, "," & e & ",", "," & x & ",", vbTextCompare) = 0 Then
+        AppendCsv = e & "," & x
+    Else
+        AppendCsv = e
+    End If
+
+End Function
+
+
+' =============================================================================
+' TEXT-SAFE IDENTIFIERS  -  the replacement for blanket NumberFormat = "@"
+'
+' Long identifiers must not be turned into numbers: Excel would show a swap id
+' as 1.23457E+14 and, worse, round away its last digits.  The old fix was to
+' format whole columns as text, which is what pushed the sheets' UsedRange to
+' row 50,004 and made every subsequent clear a 50,000-row operation.
+'
+' A leading apostrophe does the same job per value.  It is a display prefix,
+' not part of the cell's value - reading the cell back gives the id unchanged -
+' and it changes no cell format at all.  Applied only when the id would
+' otherwise be read as a number, so ISINs and contract labels are written
+' exactly as they are.
+' =============================================================================
+Private Function TextSafe(ByVal s As String) As String
+
+    If Len(s) = 0 Then Exit Function
+
+    If IsNumeric(s) Then
+        TextSafe = "'" & s
+    Else
+        TextSafe = s
+    End If
+
+End Function
+
+
+' =============================================================================
+' RepairStaleTextFormats used to live here.
+'
+' It reset NumberFormat to "General" on the blank rows below the data, to undo
+' the blanket text formatting an older build had left on tens of thousands of
+' empty cells.  Removed: it is the only thing in this module that wrote a cell
+' FORMAT, and this module does not write formats.
+'
+' The damage it repaired is real but it is a ONE-OFF, not something a load
+' should redo on every run.  To clear it by hand, once: select the blank rows
+' below the data on Swaps columns A, L and AN:AP, and set Format > General.
+' Save, close and reopen, and Excel recomputes UsedRange down to the real data.
+' =============================================================================
+
+
+' =============================================================================
+' SUPPORT SHEETS
+'
+' Three scratch sheets: two temporary copies of the coverage books, and the two
+' maps built from them.  Headers are written ONLY into cells that are empty, so
+' re-running the load never overwrites a label the desk retitled, and no font,
+' colour or alignment is applied to any of them.
+' =============================================================================
+
+
+Private Function GetOrAddSheet(ByVal sheetName As String) As Worksheet
+
+    Dim ws As Worksheet
+
+    On Error Resume Next
+    Set ws = ThisWorkbook.Worksheets(sheetName)
+    On Error GoTo 0
+
+    If ws Is Nothing Then
+        Set ws = ThisWorkbook.Worksheets.Add( _
+            After:=ThisWorkbook.Worksheets(ThisWorkbook.Worksheets.Count))
+        ws.Name = sheetName
+    End If
+
+    Set GetOrAddSheet = ws
+
+End Function
+
+
+' Write a header label only where there is not one already.
+'
+' The old SetupFuturesFinalHeaders / SetupSwapsFinalHeaders wrote the whole
+' header row on every run and then set Font.Bold and HorizontalAlignment across
+' it.  That is the "de-formats the file" complaint: a load is not the place to
+' restate the desk's own formatting, and an Array() assignment across a span
+' also silently pads with #N/A when the array and the span disagree.  One cell
+' at a time, only when blank, no formatting.
+Private Sub SetHeaderIfBlank( _
+    ByVal ws As Worksheet, _
+    ByVal col As String, _
+    ByVal headerRow As Long, _
+    ByVal label As String)
+
+    If Len(CleanText(ws.Cells(headerRow, colNum(col)).value)) = 0 Then
+        ws.Cells(headerRow, colNum(col)).value = label
+    End If
+
+End Sub
+
+
+' =============================================================================
+' HEADER ASSERTION  -  the macro CHECKS row 4, it does not write it
+'
+' This used to be EnsureHedgeSheetHeaders, which wrote a label into any header
+' cell it found empty.  Two problems with that, and the second is the reason
+' every hedge read as zero for as long as it did:
+'
+'   The header row is the desk's, not the macro's.  Filling a blank is a small
+'   liberty, but it is still the load rewriting a label row it does not own.
+'
+'   More importantly it made the WRONG layout invisible.  When this module's
+'   column constants drifted ten places from the sheet, writing headers into
+'   the columns it believed in produced a Futures sheet with "Hedge_Source"
+'   sitting over Coverage_BPV and everything still looking populated.  Nothing
+'   failed.  The SUMIFS behind the attribution simply matched nothing, and a
+'   fully hedged book reported as unhedged.
+'
+' So the direction is reversed.  Row 4 is now READ and compared against the
+' layout this module compiles against, and a disagreement stops the run BEFORE
+' a single cell is written - naming the sheet, the column letter, what was
+' expected and what is actually there.  A layout change is then a message, not
+' a silent zero.
+'
+' Comparison is case-insensitive and ignores surrounding whitespace, so
+' retitling for readability is fine; only a genuinely different column is a
+' failure.
+' =============================================================================
+
+
+' Returns "" when both sheets match, otherwise a description of every column
+' that does not.
+Private Function AssertHedgeSheetHeaders( _
+    ByVal wsFut As Worksheet, _
+    ByVal wsSw As Worksheet) As String
+
+    Dim bad As String
+
+    bad = HeaderMismatches(wsFut, SH_FUTURES, FUT_HEADER_ROW, ExpectedFuturesHeaders())
+    bad = bad & HeaderMismatches(wsSw, SH_SWAPS, SWAP_HEADER_ROW, ExpectedSwapHeaders())
+
+    If Len(bad) = 0 Then Exit Function
+
+    AssertHedgeSheetHeaders = _
+        "The hedge sheets are not laid out the way this macro expects, so " & _
+        "nothing was loaded." & vbCrLf & vbCrLf & _
+        "Every column below is read or written by name.  Loading against a " & _
+        "shifted layout writes hedge data on top of market data and makes " & _
+        "every hedge sum to zero, which is why the run stops here instead." & _
+        vbCrLf & vbCrLf & bad & vbCrLf & _
+        "Fix the header row, or tell the desk's developer which columns moved."
+
+End Function
+
+
+Private Function HeaderMismatches( _
+    ByVal ws As Worksheet, _
+    ByVal sheetName As String, _
+    ByVal headerRow As Long, _
+    ByVal expected As Variant) As String
+
+    Dim i As Long
+    Dim actual As String
+    Dim want As String
+    Dim out As String
+
+    For i = LBound(expected) To UBound(expected)
+
+        want = CStr(expected(i))
+
+        If Len(want) > 0 Then
+
+            actual = LCase$(Trim$(CleanText(ws.Cells(headerRow, i + 1).value)))
+
+            If actual <> LCase$(want) Then
+
+                out = out & "  " & sheetName & "!" & _
+                      ColLetterFromNumber(i + 1) & headerRow & _
+                      "  expected """ & want & """"
+
+                If Len(actual) = 0 Then
+                    out = out & ", found it empty" & vbCrLf
+                Else
+                    out = out & ", found """ & _
+                          CleanText(ws.Cells(headerRow, i + 1).value) & """" & vbCrLf
+                End If
+
+            End If
+
+        End If
+
+    Next i
+
+    HeaderMismatches = out
+
+End Function
+
+
+' The 42 Futures columns, in order.  Index 0 is column A.
+Private Function ExpectedFuturesHeaders() As Variant
+
+    ExpectedFuturesHeaders = Array( _
+        "ContractCode", "Exchange", "CCY", "Contracts", "FaceValue", _
+        "DelivDate", "CTD_ISIN", "CTD_CF", "Portfolio", "LinkedISIN", _
+        "AvgEntryPx", "DaysToDeliv", "FX_T0", "FutPx_T0", "CTD_DirtyPx_T0", _
+        "CTD_Ticker_T-1", "FutPx_T-1", "ImpliedRepo_Calc", "GrossBasis_Calc", _
+        "NotionalValue_EUR", "FuturesPnL_EUR", "BBG_Ticker", "Status_T0", _
+        "Status_T-1", "FUT_VAL_PT", "CTD_Ticker", "HedgeUnitDV01", _
+        "Futures_DV01_EUR", "ImpliedRepo_BBG", "NetBasis_BBG", _
+        "GrossBasis_BBG", "Status", "Coverage_SourceRow", "CoverageRelation", _
+        "FutureLabel", "HedgeType", "Coverage_StartDate", "CoverageInfo_D", _
+        "Hedge_Source", "Coverage_BPV", "Hedge_Class", "Link_Source")
+
+End Function
+
+
+' The 78 Swaps columns, in order.  Index 0 is column A.
+'
+' The BQL block genuinely appears twice - at P:X and again at BA:BI - so the
+' repetition below is the sheet, not a copy-paste slip.
+Private Function ExpectedSwapHeaders() As Variant
+
+    ExpectedSwapHeaders = Array( _
+        "DealID", "Ccy", "Notional", "FixedRate", "FloatIndex", _
+        "FloatSpread", "StartDate", "EndDate", "PayFixed", "Portfolio", _
+        "FloatCurve_Type", "LinkedISIN", "Cpty", "YearFrac", "DV01 BBG", _
+        "BQL_NPV_Direct_T0", "BQL_NPV_Fixed_T0", "BQL_NPV_Float_T0", _
+        "BQL_NPV_Total_T0", "BQL_NPV_Direct_T-1", "BQL_NPV_Fixed_T-1", _
+        "BQL_NPV_Float_T-1", "BQL_NPV_Total_T-1", "BQL_Swap_PnL", _
+        "OIS_T0", "OIS_T-1", "DF_T0", "DF_T-1", "Annuity_T0", "Annuity_T-1", _
+        "FX", "PV_T0 da anuidade", "PV_T-1 da anuidade", _
+        "Swap_DV01 Calculated In house", "Model_PnL", "Status", "PnL_Source", _
+        "PnL", "AF_Status", "BBG_Swap_Direct_ID", "BBG_Fixed_Leg_ID", _
+        "BBG_Float_Leg_ID", "Swap_ID_Source", "CoverageRelation", _
+        "SwapMap_SourceRow", "SwapMap_Class", "SwapMap_Status", _
+        "Map_Notional", "Map_CCY", "Map_Counterparty", "Notional_Final", _
+        "Notional_Source", "BQL_NPV_Direct_T0", "BQL_NPV_Fixed_T0", _
+        "BQL_NPV_Float_T0", "BQL_NPV_Total_T0", "BQL_NPV_Direct_T-1", _
+        "BQL_NPV_Fixed_T-1", "BQL_NPV_Float_T-1", "BQL_NPV_Total_T-1", _
+        "BQL_Swap_PnL", "BQL_Swap_Status", "PAY_FLT_RATE_IDX", _
+        "FloatIndex_Family", "FloatIndex_Tenor", "FloatCurve_T0", _
+        "FloatCurve_T-1", "ModelSpread_T0", "ModelSpread_T-1", _
+        "Delta_FloatCurve_bp", "Delta_ModelSpread_bp", "Reserved_1", _
+        "Reserved_2", "Reserved_3", "Reserved_4", _
+        "Swap_DV01_EUR_Theoretical", "FloatFamily_Status", "Link_Source")
+
+End Function
+
+
+Private Function ColLetterFromNumber(ByVal n As Long) As String
+
+    Dim s As String
+    Dim r As Long
+
+    Do While n > 0
+        r = (n - 1) Mod 26
+        s = Chr$(65 + r) & s
+        n = (n - 1) \ 26
+    Loop
+
+    ColLetterFromNumber = s
+
+End Function
+
+
+Private Function EnsureSwapMapSheet() As Worksheet
+
+    Dim ws As Worksheet
+
+    Set ws = GetOrAddSheet(SH_SWAPMAP)
+
+    SetHeaderIfBlank ws, SMCOL_SOURCEROW, MAP_HEADER_ROW, "SourceRow"
+    SetHeaderIfBlank ws, SMCOL_COVERAGERELATION, MAP_HEADER_ROW, "CoverageRelation"
+    SetHeaderIfBlank ws, SMCOL_LINKEDISIN, MAP_HEADER_ROW, "LinkedISIN"
+    SetHeaderIfBlank ws, SMCOL_SWAP_ID_SOURCE, MAP_HEADER_ROW, "Swap_ID_Source"
+    SetHeaderIfBlank ws, SMCOL_SWAP_DIRECT_ID, MAP_HEADER_ROW, "Swap_Direct_ID"
+    SetHeaderIfBlank ws, SMCOL_FIXED_LEG_ID, MAP_HEADER_ROW, "Fixed_Leg_ID"
+    SetHeaderIfBlank ws, SMCOL_FLOAT_LEG_ID, MAP_HEADER_ROW, "Float_Leg_ID"
+    SetHeaderIfBlank ws, SMCOL_IMPORTSTATUS, MAP_HEADER_ROW, "ImportStatus"
+    SetHeaderIfBlank ws, SMCOL_COUNTERPARTY, MAP_HEADER_ROW, "Counterparty"
+    SetHeaderIfBlank ws, SMCOL_NOTIONAL, MAP_HEADER_ROW, "Notional"
+    SetHeaderIfBlank ws, SMCOL_STARTDATE, MAP_HEADER_ROW, "StartDate"
+    SetHeaderIfBlank ws, SMCOL_ENDDATE, MAP_HEADER_ROW, "EndDate"
+    SetHeaderIfBlank ws, SMCOL_CCY, MAP_HEADER_ROW, "CCY"
+    SetHeaderIfBlank ws, SMCOL_NOTIONAL_SOURCE, MAP_HEADER_ROW, "Notional_Source"
+    SetHeaderIfBlank ws, SMCOL_RC_KEY, MAP_HEADER_ROW, "RC_Key"
+    SetHeaderIfBlank ws, SMCOL_LINK_SOURCE, MAP_HEADER_ROW, "Link_Source"
+
+    Set EnsureSwapMapSheet = ws
+
+End Function
+
+
+Private Function EnsureCoverageFuturesSheet() As Worksheet
+
+    Dim ws As Worksheet
+
+    Set ws = GetOrAddSheet(SH_COV_FUTURES)
+
+    SetHeaderIfBlank ws, CFCOL_SOURCEROW, MAP_HEADER_ROW, "SourceRow"
+    SetHeaderIfBlank ws, CFCOL_COVERAGERELATION, MAP_HEADER_ROW, "CoverageRelation"
+    SetHeaderIfBlank ws, CFCOL_LINKEDISIN, MAP_HEADER_ROW, "LinkedISIN"
+    SetHeaderIfBlank ws, CFCOL_COVERAGEINFO_D, MAP_HEADER_ROW, "CoverageInfo_D"
+    SetHeaderIfBlank ws, CFCOL_FUTURELABEL, MAP_HEADER_ROW, "FutureLabel"
+    SetHeaderIfBlank ws, CFCOL_FUTURECODE, MAP_HEADER_ROW, "FutureCode"
+    SetHeaderIfBlank ws, CFCOL_HEDGETYPE, MAP_HEADER_ROW, "HedgeType"
+    SetHeaderIfBlank ws, CFCOL_CONTRACTS, MAP_HEADER_ROW, "Contracts"
+    SetHeaderIfBlank ws, CFCOL_STARTDATE, MAP_HEADER_ROW, "StartDate"
+    SetHeaderIfBlank ws, CFCOL_CCY, MAP_HEADER_ROW, "CCY"
+    SetHeaderIfBlank ws, CFCOL_IMPORTSTATUS, MAP_HEADER_ROW, "ImportStatus"
+    SetHeaderIfBlank ws, CFCOL_HEDGE_SOURCE, MAP_HEADER_ROW, "Hedge_Source"
+    SetHeaderIfBlank ws, CFCOL_BPV, MAP_HEADER_ROW, "Coverage_BPV"
+    SetHeaderIfBlank ws, CFCOL_RC_KEY, MAP_HEADER_ROW, "RC_Key"
+    SetHeaderIfBlank ws, CFCOL_LINK_SOURCE, MAP_HEADER_ROW, "Link_Source"
+
+    Set EnsureCoverageFuturesSheet = ws
+
+End Function
+
+
+Private Function EnsureCoverageSupportSheet() As Worksheet
+    Set EnsureCoverageSupportSheet = GetOrAddSheet(SH_COV_SUPPORT)
+End Function
+
+
+Private Function EnsureCoverageTotalSupportSheet() As Worksheet
+    Set EnsureCoverageTotalSupportSheet = GetOrAddSheet(SH_COV_TOTAL_SUPPORT)
+End Function
+
+
+' Contents only.  The old versions also called ClearFormats, which is a
+' formatting write and is exactly what this module is no longer allowed to do.
+Private Sub ClearCoverageSupportSheet()
+
+    Dim ws As Worksheet
+
+    Set ws = EnsureCoverageSupportSheet()
+
+    ws.Range("A" & SWAP_ID_FIRST_ROW & ":" & _
+             HEDGE_RISCO_FORMULA_A_COL & SWAP_ID_LAST_ROW).ClearContents
+
+End Sub
+
+
+Private Sub ClearCoverageTotalSupportSheet()
+
+    Dim ws As Worksheet
+
+    Set ws = EnsureCoverageTotalSupportSheet()
+
+    ws.Range("A" & HEDGE_TOTAL_FIRST_ROW & ":" & _
+             HEDGE_TOTAL_FORMULA_A_COL & HEDGE_TOTAL_LAST_ROW).ClearContents
+
+End Sub
+
+
+' =============================================================================
+' READING THE TWO COVERAGE BOOKS
+'
+' Values only.  Reading .Value2 rather than copying the range keeps the source
+' book's own formulas, links and formatting out of this workbook entirely -
+' which also means a load can never import a style change from a file the desk
+' did not intend to restyle this workbook with.
+'
+' Column A's FORMULA text is kept alongside, because in both books the coverage
+' relation is often a link into another sheet and the displayed value alone
+' cannot say which relation a row belongs to.
+'
+' Returns "" on success, or the reason it could not read the book.  A failure
+' is a partial load, not a dead run: the other book still gets loaded.
+' =============================================================================
+Private Function CopyCoverageBook( _
+    ByVal bookPath As String, _
+    ByVal sheetName As String, _
+    ByVal firstRow As Long, _
+    ByVal lastRow As Long, _
+    ByVal lastCol As String, _
+    ByVal formulaCol As String, _
+    ByVal wsDst As Worksheet) As String
+
+    Dim wbSrc As Workbook
+    Dim wsSrc As Worksheet
+    Dim wasOpen As Boolean
+    Dim arrValues As Variant
+    Dim arrFormulaA As Variant
+    Dim i As Long
+    Dim fileName As String
+
+    On Error GoTo Fail
+
+    fileName = Dir$(bookPath)
+
+    If Len(fileName) = 0 Then
+        CopyCoverageBook = "not found: " & bookPath
+        Exit Function
+    End If
+
+    ' Already open in this Excel instance?  Reuse it rather than opening a
+    ' second copy, which Excel refuses anyway.
+    On Error Resume Next
+    Set wbSrc = Workbooks(fileName)
+    On Error GoTo Fail
+
+    If wbSrc Is Nothing Then
+        Set wbSrc = Workbooks.Open( _
+            fileName:=bookPath, UpdateLinks:=0, ReadOnly:=True)
+        wasOpen = False
+    Else
+        wasOpen = True
+    End If
+
+    Set wsSrc = wbSrc.Worksheets(sheetName)
+
+    arrValues = wsSrc.Range( _
+        "A" & firstRow & ":" & lastCol & lastRow).Value2
+
+    arrFormulaA = wsSrc.Range("A" & firstRow & ":A" & lastRow).Formula
+
+    wsDst.Range("A" & firstRow & ":" & lastCol & lastRow).Value2 = arrValues
+
+    For i = 1 To UBound(arrFormulaA, 1)
+        ' Written text-safe rather than by formatting the column: the formula
+        ' text starts with "=" and would otherwise be evaluated.
+        wsDst.Cells(firstRow + i - 1, colNum(formulaCol)).value = _
+            "'" & CStr(arrFormulaA(i, 1))
+    Next i
+
+    If Not wasOpen Then wbSrc.Close SaveChanges:=False
+
+    Exit Function
+
+Fail:
+
+    CopyCoverageBook = "Error " & CStr(Err.Number) & ": " & Err.Description
+
+    ' Never leave a book this procedure opened hanging around after a failure.
+    On Error Resume Next
+    If Not wbSrc Is Nothing Then
+        If Not wasOpen Then wbSrc.Close SaveChanges:=False
+    End If
+    On Error GoTo 0
+
+End Function
+
+
+' =============================================================================
+' ROW CLASSIFICATION  (which rows of a coverage book are ours, and what they are)
+' =============================================================================
+
+
+' The Resumo swap rows are the ones whose column A carries the desk's
+' MONTH(EDATE(..)) roll formula.
+Private Function IsResumoSwapRow(ByVal formulaText As String) As Boolean
+    IsResumoSwapRow = (InStr(1, UCase$(formulaText), "MONTH(EDATE(", vbTextCompare) > 0)
+End Function
+
+
+' The accounting classification this desk hedges under.  Written tolerantly
+' because the two books spell it differently: "HtC&S", "HTC & S", "HtCS".
+Private Function IsHtCSCoveragePortfolio(ByVal v As Variant) As Boolean
+
+    Dim s As String
+
+    s = UCase$(CleanText(v))
+    s = Replace(s, " ", "")
+    s = Replace(s, ".", "")
+    s = Replace(s, "-", "")
+    s = Replace(s, "_", "")
+    s = Replace(s, "&AMP;", "&")
+    s = Replace(s, "AND", "&")
+
+    IsHtCSCoveragePortfolio = _
+        (InStr(1, s, "HTC&S", vbTextCompare) > 0) Or _
+        (InStr(1, s, "HTCS", vbTextCompare) > 0)
+
+End Function
+
+
+Private Function IsAlphanumericLabel(ByVal s As String) As Boolean
+
+    Dim i As Long
+
+    s = CleanText(s)
+    If Len(s) = 0 Then Exit Function
+
+    For i = 1 To Len(s)
+        If Mid$(s, i, 1) Like "[A-Za-z0-9]" Then
+            IsAlphanumericLabel = True
+            Exit Function
+        End If
+    Next i
+
+End Function
+
+
+Private Function IsCoverageFutureRow( _
+    ByVal valueA As String, _
+    ByVal formulaA As String, _
+    ByVal typeH As String) As Boolean
+
+    valueA = CleanText(valueA)
+
+    If Len(valueA) = 0 Then Exit Function
+    If IsResumoSwapRow(CleanText(formulaA)) Then Exit Function
+    If UCase$(CleanText(typeH)) = "PLAIN VANILLA SWAP" Then Exit Function
+
+    IsCoverageFutureRow = IsAlphanumericLabel(valueA)
+
+End Function
+
+
+' True when a coverage instrument label describes a swap rather than a future.
+' A swap sent to Bloomberg as a contract code comes back #N/A, so it must not
+' become a futures row.
+Private Function IsCoverageSwapTypeLabel(ByVal v As Variant) As Boolean
+
+    Dim s As String
+
+    s = UCase$(CleanText(v))
+
+    IsCoverageSwapTypeLabel = _
+        (InStr(1, s, "SWAP", vbTextCompare) > 0) Or _
+        (InStr(1, s, "IRS", vbTextCompare) > 0)
+
+End Function
+
+
+' "OE1 #163" -> "OE";  "RX1 #164" -> "RX";  "OAT1 #165" -> "OAT".
+Private Function FutureCodeFromCoverageLabel(ByVal futureLabel As String) As String
+
+    Dim s As String
+    Dim firstToken As String
+
+    s = CleanText(futureLabel)
+    If Len(s) = 0 Then Exit Function
+
+    firstToken = Split(s, " ")(0)
+
+    Do While Len(firstToken) > 0 And Right$(firstToken, 1) Like "[0-9]"
+        firstToken = Left$(firstToken, Len(firstToken) - 1)
+    Loop
+
+    FutureCodeFromCoverageLabel = firstToken
+
+End Function
+
+
+Private Function SwapIdToBBGSecurity(ByVal rawId As Variant) As String
+
+    Dim s As String
+
+    s = CleanText(rawId)
+
+    If Len(s) = 0 Then
+        SwapIdToBBGSecurity = ""
+    ElseIf InStr(1, UCase$(s), " CORP", vbTextCompare) > 0 Then
+        SwapIdToBBGSecurity = s
+    Else
+        SwapIdToBBGSecurity = s & " Corp"
+    End If
+
+End Function
+
+
+' The desk writes notionals as numbers, as "25MM", or as "25 M EUR".
+Private Function CoverageNotionalValue(ByVal v As Variant) As Variant
+
+    Dim s As String
+    Dim n As Double
+
+    If IsError(v) Then Exit Function
+    If IsNumeric(v) Then
+        CoverageNotionalValue = CDbl(v)
+        Exit Function
+    End If
+
+    s = UCase$(CleanText(v))
+    If Len(s) = 0 Then
+        CoverageNotionalValue = ""
+        Exit Function
+    End If
+
+    s = Replace(s, "EUR", "")
+    s = Replace(s, "USD", "")
+    s = Replace(s, "GBP", "")
+    s = Replace(s, ChrW$(8364), "")      ' the euro sign, whatever the code page
+    s = Replace(s, " ", "")
+
+    If InStr(1, s, "MM", vbTextCompare) > 0 Then
+        n = val(Replace(Replace(s, "MM", ""), ",", "."))
+        CoverageNotionalValue = n * 1000000#
+        Exit Function
+    End If
+
+    If Right$(s, 1) = "M" Then
+        n = val(Replace(Left$(s, Len(s) - 1), ",", "."))
+        CoverageNotionalValue = n * 1000000#
+        Exit Function
+    End If
+
+    CoverageNotionalValue = CDblSafe(v)
+
+End Function
+
+
+Private Function HasAnySwapId( _
+    ByVal directId As String, _
+    ByVal fixedId As String, _
+    ByVal floatId As String) As Boolean
+
+    HasAnySwapId = (Len(directId) > 0 Or Len(fixedId) > 0 Or Len(floatId) > 0)
+
+End Function
+
+
+' =============================================================================
+' BUILDING THE TWO MAPS
+'
+' Both map sheets are filled from a staged array and written in ONE assignment.
+' Cell-by-cell writing was not just slow: with a few hundred rows x fifteen
+' columns it is thousands of round trips into Excel, which is what made the
+' button look like it had hung.
+' =============================================================================
+
+
+' SwapMap, from Hedge Risco Tx Juro.  Plain-vanilla and synthetic swaps are two
+' groups of columns on the SAME source row, so one row can produce two mapping
+' rows.
+Private Function BuildSwapMapFromCoverageSupport( _
+    ByVal rcByRow As Object, _
+    ByVal rcIndex As Object) As Long
+
+    Dim wsCov As Worksheet
+    Dim wsMap As Worksheet
+    Dim r As Long
+    Dim n As Long
+    Dim buf As Variant
+    Dim colCount As Long
+
+    Dim formulaA As String
+    Dim rcKey As String
+    Dim rowIsin As String
+    Dim linkedISIN As String
+    Dim linkSource As String
+    Dim statusText As String
+    Dim directId As String
+    Dim fixedId As String
+    Dim floatId As String
+    Dim counterparty As String
+    Dim ccy As String
+    Dim startDate As Variant
+
+    Set wsCov = EnsureCoverageSupportSheet()
+    Set wsMap = EnsureSwapMapSheet()
+
+    colCount = colNum(SMCOL_LINK_SOURCE)
+
+    ' Two mapping rows per source row is the worst case.
+    ReDim buf(1 To (SWAP_ID_LAST_ROW - SWAP_ID_FIRST_ROW + 1) * 2, 1 To colCount)
+
+    For r = SWAP_ID_FIRST_ROW To SWAP_ID_LAST_ROW
+
+        If IsHtCSCoveragePortfolio( _
+            wsCov.Cells(r, HEDGE_RISCO_PORTFOLIO_TYPE_COL).value) Then
+
+            formulaA = CleanText(wsCov.Cells(r, HEDGE_RISCO_FORMULA_A_COL).value)
+            If Len(formulaA) = 0 Then
+                formulaA = CleanText(wsCov.Cells(r, "A").value)
+            End If
+
+            If IsResumoSwapRow(formulaA) Then
+
+                rcKey = ""
+                If rcByRow.Exists(r) Then rcKey = CStr(rcByRow(r))
+
+                rowIsin = CleanText(wsCov.Cells(r, RTJ_ISIN_COL).value)
+                linkedISIN = ResolveCoveredBond(rcIndex, rcKey, rowIsin, linkSource)
+
+                counterparty = CleanText(wsCov.Cells(r, RTJ_CPTY_COL).value)
+                ccy = CleanText(wsCov.Cells(r, RTJ_CCY_COL).value)
+                startDate = wsCov.Cells(r, RTJ_STARTDATE_COL).value
+
+                If Len(linkedISIN) = 0 Then
+                    statusText = "No covered bond for coverage relation " & rcKey
+                Else
+                    statusText = "OK"
+                End If
+
+                ' --- plain vanilla: ids I/J/K, notional O, end date Q --------
+                directId = SwapIdToBBGSecurity(wsCov.Cells(r, RTJ_PLAIN_DIRECT_COL).value)
+                fixedId = SwapIdToBBGSecurity(wsCov.Cells(r, RTJ_PLAIN_FIXED_COL).value)
+                floatId = SwapIdToBBGSecurity(wsCov.Cells(r, RTJ_PLAIN_FLOAT_COL).value)
+
+                If HasAnySwapId(directId, fixedId, floatId) Then
+                    n = n + 1
+                    FillSwapMapRow buf, n, r, rcKey, linkedISIN, linkSource, _
+                        "PLAIN", directId, fixedId, floatId, statusText, _
+                        counterparty, _
+                        CoverageNotionalValue(wsCov.Cells(r, RTJ_NOTIONAL_COL).value), _
+                        startDate, _
+                        wsCov.Cells(r, RTJ_ENDDATE_COL).value, _
+                        ccy, "PLAIN_O"
+                End If
+
+                ' --- synthetic: ids AC/AD/AE, notional AF, end date AI -------
+                directId = SwapIdToBBGSecurity(wsCov.Cells(r, RTJ_SYNTH_DIRECT_COL).value)
+                fixedId = SwapIdToBBGSecurity(wsCov.Cells(r, RTJ_SYNTH_FIXED_COL).value)
+                floatId = SwapIdToBBGSecurity(wsCov.Cells(r, RTJ_SYNTH_FLOAT_COL).value)
+
+                If HasAnySwapId(directId, fixedId, floatId) Then
+                    n = n + 1
+                    FillSwapMapRow buf, n, r, rcKey, linkedISIN, linkSource, _
+                        "SYNTHETIC", directId, fixedId, floatId, statusText, _
+                        counterparty, _
+                        CoverageNotionalValue(wsCov.Cells(r, RTJ_SYNTH_NOTIONAL_COL).value), _
+                        startDate, _
+                        wsCov.Cells(r, RTJ_SYNTH_ENDDATE_COL).value, _
+                        ccy, "SYNTHETIC_AF"
+                End If
+
+            End If
+
+        End If
+
+    Next r
+
+    WriteMapBlock wsMap, buf, n, colCount, SMCOL_SOURCEROW, SMCOL_LINK_SOURCE
+
+    BuildSwapMapFromCoverageSupport = n
+
+End Function
+
+
+Private Sub FillSwapMapRow( _
+    ByRef buf As Variant, _
+    ByVal n As Long, _
+    ByVal sourceRow As Long, _
+    ByVal rcKey As String, _
+    ByVal linkedISIN As String, _
+    ByVal linkSource As String, _
+    ByVal idSource As String, _
+    ByVal directId As String, _
+    ByVal fixedId As String, _
+    ByVal floatId As String, _
+    ByVal statusText As String, _
+    ByVal counterparty As String, _
+    ByVal notional As Variant, _
+    ByVal startDate As Variant, _
+    ByVal endDate As Variant, _
+    ByVal ccy As String, _
+    ByVal notionalSource As String)
+
+    buf(n, colNum(SMCOL_SOURCEROW)) = sourceRow
+    buf(n, colNum(SMCOL_COVERAGERELATION)) = rcKey
+    buf(n, colNum(SMCOL_LINKEDISIN)) = linkedISIN
+    buf(n, colNum(SMCOL_SWAP_ID_SOURCE)) = idSource
+    buf(n, colNum(SMCOL_SWAP_DIRECT_ID)) = TextSafe(directId)
+    buf(n, colNum(SMCOL_FIXED_LEG_ID)) = TextSafe(fixedId)
+    buf(n, colNum(SMCOL_FLOAT_LEG_ID)) = TextSafe(floatId)
+    buf(n, colNum(SMCOL_IMPORTSTATUS)) = statusText
+    buf(n, colNum(SMCOL_COUNTERPARTY)) = counterparty
+    buf(n, colNum(SMCOL_NOTIONAL)) = notional
+    buf(n, colNum(SMCOL_STARTDATE)) = startDate
+    buf(n, colNum(SMCOL_ENDDATE)) = endDate
+    buf(n, colNum(SMCOL_CCY)) = ccy
+    buf(n, colNum(SMCOL_NOTIONAL_SOURCE)) = notionalSource
+    buf(n, colNum(SMCOL_RC_KEY)) = rcKey
+    buf(n, colNum(SMCOL_LINK_SOURCE)) = linkSource
+
+End Sub
+
+
+' CoverageFutures, from Hedge Risco Tx Juro.
+Private Function BuildCoverageFuturesMapFromCoverageSupport( _
+    ByVal rcByRow As Object, _
+    ByVal rcIndex As Object) As Long
+
+    Dim wsCov As Worksheet
+    Dim wsFMap As Worksheet
+    Dim r As Long
+    Dim n As Long
+    Dim buf As Variant
+    Dim colCount As Long
+
+    Dim valueA As String
+    Dim formulaA As String
+    Dim typeH As String
+    Dim rcKey As String
+    Dim linkedISIN As String
+    Dim linkSource As String
+    Dim futureCode As String
+    Dim contracts As Variant
+
+    Set wsCov = EnsureCoverageSupportSheet()
+    Set wsFMap = EnsureCoverageFuturesSheet()
+
+    colCount = colNum(CFCOL_LINK_SOURCE)
+
+    ReDim buf(1 To SWAP_ID_LAST_ROW - SWAP_ID_FIRST_ROW + 1, 1 To colCount)
+
+    For r = SWAP_ID_FIRST_ROW To SWAP_ID_LAST_ROW
+
+        If IsHtCSCoveragePortfolio( _
+            wsCov.Cells(r, HEDGE_RISCO_PORTFOLIO_TYPE_COL).value) Then
+
+            valueA = CleanText(wsCov.Cells(r, "A").value)
+            formulaA = CleanText(wsCov.Cells(r, HEDGE_RISCO_FORMULA_A_COL).value)
+            typeH = CleanText(wsCov.Cells(r, RTJ_TYPE_COL).value)
+
+            If IsCoverageFutureRow(valueA, formulaA, typeH) Then
+
+                rcKey = ""
+                If rcByRow.Exists(r) Then rcKey = CStr(rcByRow(r))
+
+                linkedISIN = ResolveCoveredBond( _
+                    rcIndex, rcKey, _
+                    CStr(wsCov.Cells(r, RTJ_ISIN_COL).value), linkSource)
+
+                futureCode = FutureCodeFromCoverageLabel(valueA)
+                contracts = CoverageNotionalValue(wsCov.Cells(r, RTJ_NOTIONAL_COL).value)
+
+                n = n + 1
+
+                buf(n, colNum(CFCOL_SOURCEROW)) = r
+                buf(n, colNum(CFCOL_COVERAGERELATION)) = rcKey
+                buf(n, colNum(CFCOL_LINKEDISIN)) = linkedISIN
+                buf(n, colNum(CFCOL_COVERAGEINFO_D)) = CleanText(wsCov.Cells(r, RTJ_INFO_COL).value)
+                buf(n, colNum(CFCOL_FUTURELABEL)) = valueA
+                buf(n, colNum(CFCOL_FUTURECODE)) = futureCode
+                buf(n, colNum(CFCOL_HEDGETYPE)) = typeH
+                buf(n, colNum(CFCOL_CONTRACTS)) = contracts
+                buf(n, colNum(CFCOL_STARTDATE)) = wsCov.Cells(r, RTJ_STARTDATE_COL).value
+                buf(n, colNum(CFCOL_CCY)) = CleanText(wsCov.Cells(r, RTJ_CCY_COL).value)
+                buf(n, colNum(CFCOL_IMPORTSTATUS)) = _
+                    CoverageImportStatus(linkedISIN, futureCode, contracts, rcKey)
+                buf(n, colNum(CFCOL_HEDGE_SOURCE)) = HEDGE_SOURCE_RTJ
+                buf(n, colNum(CFCOL_RC_KEY)) = rcKey
+                buf(n, colNum(CFCOL_LINK_SOURCE)) = linkSource
+
+            End If
+
+        End If
+
+    Next r
+
+    WriteMapBlock wsFMap, buf, n, colCount, CFCOL_SOURCEROW, CFCOL_LINK_SOURCE
+
+    BuildCoverageFuturesMapFromCoverageSupport = n
+
+End Function
+
+
+' CoverageFutures, from Hedge Risco Total.  APPENDS underneath whatever the Tx
+' Juro pass wrote: this pass ADDS a second book, it does not replace the first.
+Private Function AppendCoverageFuturesMapFromCoverageTotal( _
+    ByVal rcByRow As Object, _
+    ByVal rcIndex As Object) As Long
+
+    Dim wsCov As Worksheet
+    Dim wsFMap As Worksheet
+    Dim r As Long
+    Dim n As Long
+    Dim outRow As Long
+    Dim buf As Variant
+    Dim colCount As Long
+
+    Dim rcKey As String
+    Dim linkedISIN As String
+    Dim linkSource As String
+    Dim typeLabel As String
+    Dim futureCode As String
+    Dim contracts As Variant
+    Dim statusText As String
+
+    Set wsCov = EnsureCoverageTotalSupportSheet()
+    Set wsFMap = EnsureCoverageFuturesSheet()
+
+    colCount = colNum(CFCOL_LINK_SOURCE)
+
+    ReDim buf(1 To HEDGE_TOTAL_LAST_ROW - HEDGE_TOTAL_FIRST_ROW + 1, 1 To colCount)
+
+    For r = HEDGE_TOTAL_FIRST_ROW To HEDGE_TOTAL_LAST_ROW
+
+        If IsHtCSCoveragePortfolio( _
+            wsCov.Cells(r, HEDGE_TOTAL_PORTFOLIO_TYPE_COL).value) Then
+
+            typeLabel = CleanText(wsCov.Cells(r, HEDGE_TOTAL_TYPE_COL).value)
+
+            rcKey = ""
+            If rcByRow.Exists(r) Then rcKey = CStr(rcByRow(r))
+
+            linkedISIN = ResolveCoveredBond( _
+                rcIndex, rcKey, _
+                CStr(wsCov.Cells(r, RT_ISIN_COL).value), linkSource)
+
+            contracts = CoverageNotionalValue( _
+                wsCov.Cells(r, HEDGE_TOTAL_NOTIONAL_COL).value)
+
+            ' A swap in this book must not become a futures row: it would be
+            ' sent to Bloomberg as a contract code and come back #N/A.  It is
+            ' still recorded, with a status saying why it was not taken, so a
+            ' row is never silently absent from both sheets.
+            If IsCoverageSwapTypeLabel(typeLabel) Then
+                futureCode = ""
+                statusText = "Swap row in Hedge Risco Total - not loaded as a future"
+            Else
+                futureCode = FutureCodeFromCoverageLabel(typeLabel)
+                statusText = CoverageImportStatus(linkedISIN, futureCode, contracts, rcKey)
+            End If
+
+            If Len(typeLabel) > 0 Or Len(linkedISIN) > 0 Then
+
+                n = n + 1
+
+                buf(n, colNum(CFCOL_SOURCEROW)) = r
+                buf(n, colNum(CFCOL_COVERAGERELATION)) = rcKey
+                buf(n, colNum(CFCOL_LINKEDISIN)) = linkedISIN
+                buf(n, colNum(CFCOL_COVERAGEINFO_D)) = _
+                    CleanText(wsCov.Cells(r, HEDGE_TOTAL_COUNTERPARTY_COL).value)
+                buf(n, colNum(CFCOL_FUTURELABEL)) = typeLabel
+                buf(n, colNum(CFCOL_FUTURECODE)) = futureCode
+                buf(n, colNum(CFCOL_HEDGETYPE)) = typeLabel
+                buf(n, colNum(CFCOL_CONTRACTS)) = contracts
+                buf(n, colNum(CFCOL_STARTDATE)) = _
+                    wsCov.Cells(r, HEDGE_TOTAL_STARTDATE_COL).value
+                buf(n, colNum(CFCOL_CCY)) = _
+                    CleanText(wsCov.Cells(r, HEDGE_TOTAL_CCY_COL).value)
+                buf(n, colNum(CFCOL_IMPORTSTATUS)) = statusText
+                buf(n, colNum(CFCOL_HEDGE_SOURCE)) = HEDGE_SOURCE_RT
+                buf(n, colNum(CFCOL_BPV)) = CDblSafe(wsCov.Cells(r, HEDGE_TOTAL_BPV_COL).value)
+                buf(n, colNum(CFCOL_RC_KEY)) = rcKey
+                buf(n, colNum(CFCOL_LINK_SOURCE)) = linkSource
+
+            End If
+
+        End If
+
+    Next r
+
+    If n = 0 Then Exit Function
+
+    outRow = wsFMap.Cells(wsFMap.rows.Count, colNum(CFCOL_SOURCEROW)).End(xlUp).Row + 1
+    If outRow < DATA_ROW Then outRow = DATA_ROW
+
+    wsFMap.Range(CFCOL_SOURCEROW & outRow).Resize(n, colCount).value = buf
+
+    AppendCoverageFuturesMapFromCoverageTotal = n
+
+End Function
+
+
+' Why a mapped row will or will not produce a usable futures position.
+' Names the coverage relation when the bond could not be found, because that is
+' the thing to go and look at in the source book.
+Private Function CoverageImportStatus( _
+    ByVal linkedISIN As String, _
+    ByVal futureCode As String, _
+    ByVal contracts As Variant, _
+    ByVal rcKey As String) As String
+
+    If Len(linkedISIN) = 0 Then
+        If Len(rcKey) = 0 Then
+            CoverageImportStatus = "No coverage relation on this row"
+        Else
+            CoverageImportStatus = "No covered bond for coverage relation " & rcKey
+        End If
+    ElseIf Len(futureCode) = 0 Then
+        CoverageImportStatus = "Missing FutureCode"
+    ElseIf Not IsNumeric(contracts) Then
+        CoverageImportStatus = "Missing Contracts"
+    Else
+        CoverageImportStatus = "OK"
+    End If
+
+End Function
+
+
+' Clear a map sheet's data block and write the staged rows in one assignment.
+Private Sub WriteMapBlock( _
+    ByVal ws As Worksheet, _
+    ByRef buf As Variant, _
+    ByVal n As Long, _
+    ByVal colCount As Long, _
+    ByVal firstCol As String, _
+    ByVal lastCol As String)
+
+    Dim lastRow As Long
+
+    lastRow = LastRowInColumn(ws, firstCol, DATA_ROW)
+
+    ws.Range(firstCol & DATA_ROW & ":" & lastCol & _
+             CStr(SheetClearLastRow(ws, DATA_ROW, lastRow))).ClearContents
+
+    If n > 0 Then
+        ws.Range(firstCol & DATA_ROW).Resize(n, colCount).value = buf
+    End If
+
+End Sub
+
+
+' =============================================================================
+' POPULATING THE FUTURES AND SWAPS SHEETS
+'
+' Both are staged into an array and written in one assignment, and both stamp
+' the bond link as they go.  The bond link now uses the ISIN the COVERAGE
+' RELATION resolved, which is the whole point of the correction: a continuation
+' row of a relation carries no ISIN of its own, so under the old ISIN-only rule
+' it reached neither the Futures sheet's LinkedISIN nor Bonds!FutLink.
+'
+' The staging array is sized for the WORST case - every map row producing a
+' position - and the write asks for only the `n` rows that did.  Excel discards
+' the rest: assigning an array larger than its target range writes the
+' top-left block and drops the remainder.  Nothing beyond row `n` is touched,
+' and the clear above has already emptied it.
+' =============================================================================
+
+
+' =============================================================================
+' COLUMN OWNERSHIP
+'
+' The single most damaging thing this module used to do.
+'
+' Both append routines built a buffer as wide as the whole sheet, ClearContents
+' across that whole width, and then wrote the buffer back in one shot.  The
+' buffer only ever had values in the mapping columns, so every OTHER cell in
+' the block - every BDP, every BQL, every model formula on Futures and on
+' Swaps - was overwritten with an empty variant.  The load destroyed the sheet
+' it was loading into, on every single run.
+'
+' It went unnoticed because the old three-button order rewrote all those
+' formulas immediately afterwards.  Nothing does that any more.
+'
+' So the module now declares exactly which columns it owns.  It clears those
+' columns and writes those columns.  Every other column on Futures and Swaps is
+' out of bounds - it belongs to the formulas the desk put there.
+' =============================================================================
+
+
+' Futures columns this module writes.  Everything else on that sheet - the
+' whole L:AE market-data block, plus DelivDate, CTD_ISIN and CTD_CF - is a
+' formula fed from BBG_Ticker, and is not ours.
+Private Function FuturesOwnedColumns() As Variant
+
+    FuturesOwnedColumns = Array( _
+        FCOL_CONTRACTCODE, FCOL_CCY, FCOL_CONTRACTS, FCOL_PORTFOLIO, _
+        FCOL_LINKEDISIN, FCOL_STATUS, FCOL_COVERAGE_SOURCEROW, _
+        FCOL_COVERAGERELATION, FCOL_FUTURELABEL, FCOL_HEDGETYPE, _
+        FCOL_COVERAGE_STARTDATE, FCOL_COVERAGEINFO_D, FCOL_HEDGE_SOURCE, _
+        FCOL_COVERAGE_BPV, FCOL_HEDGE_CLASS, FCOL_LINK_SOURCE)
+
+End Function
+
+
+' Swaps columns this module writes.  The BQL block, the OIS/DF/annuity block
+' and the model columns are not here on purpose.
+Private Function SwapsOwnedColumns() As Variant
+
+    SwapsOwnedColumns = Array( _
+        WCOL_DEALID, WCOL_CCY, WCOL_NOTIONAL, WCOL_STARTDATE, WCOL_ENDDATE, _
+        WCOL_PAYFIXED, WCOL_PORTFOLIO, WCOL_FLOATCURVE_TYPE, WCOL_LINKEDISIN, _
+        WCOL_CPTY, WCOL_STATUS, WCOL_PNL_SOURCE, WCOL_AF_STATUS, _
+        WCOL_BBG_SWAP_DIRECT_ID, WCOL_BBG_FIXED_LEG_ID, WCOL_BBG_FLOAT_LEG_ID, _
+        WCOL_SWAP_ID_SOURCE, WCOL_COVERAGERELATION, WCOL_SWAPMAP_SOURCEROW, _
+        WCOL_SWAPMAP_CLASS, WCOL_SWAPMAP_STATUS, WCOL_MAP_NOTIONAL, _
+        WCOL_MAP_CCY, WCOL_MAP_COUNTERPARTY, WCOL_NOTIONAL_FINAL, _
+        WCOL_NOTIONAL_SOURCE, WCOL_LINK_SOURCE)
+
+End Function
+
+
+' Contract detail this module may fill IN ADDITION, but only into a cell that
+' is empty and only where the column is not formula-driven.  See FillSpecIfSafe.
+Private Function FuturesSpecColumns() As Variant
+
+    FuturesSpecColumns = Array(FCOL_EXCHANGE, FCOL_FACEVALUE)
+
+End Function
+
+
+Private Sub ClearOwnedColumns( _
+    ByVal ws As Worksheet, _
+    ByVal firstRow As Long, _
+    ByVal lastRow As Long, _
+    ByVal cols As Variant)
+
+    Dim i As Long
+    Dim c As String
+
+    If lastRow < firstRow Then Exit Sub
+
+    For i = LBound(cols) To UBound(cols)
+        c = CStr(cols(i))
+        ws.Range(c & firstRow & ":" & c & lastRow).ClearContents
+    Next i
+
+End Sub
+
+
+' Write the owned columns out of the full-width buffer, one column at a time.
+'
+' The buffer stays full width because indexing it by colNum() is what keeps the
+' assignments readable.  What changed is that only the owned columns are ever
+' handed to the sheet.
+Private Sub WriteOwnedColumns( _
+    ByVal ws As Worksheet, _
+    ByVal firstRow As Long, _
+    ByVal buf As Variant, _
+    ByVal n As Long, _
+    ByVal cols As Variant)
+
+    Dim i As Long
+    Dim r As Long
+    Dim c As Long
+    Dim colBuf() As Variant
+
+    If n < 1 Then Exit Sub
+
+    ReDim colBuf(1 To n, 1 To 1)
+
+    For i = LBound(cols) To UBound(cols)
+
+        c = colNum(CStr(cols(i)))
+
+        For r = 1 To n
+            colBuf(r, 1) = buf(r, c)
+        Next r
+
+        ws.Range(CStr(cols(i)) & firstRow).Resize(n, 1).value = colBuf
+
+    Next i
+
+End Sub
+
+
+' The last row in a column that currently holds a formula, or 0 if none does.
+Private Function LastFormulaRowInColumn( _
+    ByVal ws As Worksheet, _
+    ByVal col As String, _
+    ByVal firstRow As Long, _
+    ByVal searchLastRow As Long) As Long
+
+    Dim rg As Range
+    Dim area As Range
+
+    If searchLastRow < firstRow Then Exit Function
+
+    On Error Resume Next
+    Set rg = ws.Range(col & firstRow & ":" & col & searchLastRow) _
+               .SpecialCells(xlCellTypeFormulas)
+    On Error GoTo 0
+
+    If rg Is Nothing Then Exit Function
+
+    Set area = rg.Areas(rg.Areas.Count)
+
+    LastFormulaRowInColumn = area.Row + area.rows.Count - 1
+
+End Function
+
+
+' Extend the sheet's own formulas onto rows the load has just added.
+'
+' This macro does not author formulas.  It reads the R1C1 form of the formula
+' ALREADY in the column - from the last row that has one - and assigns it to
+' the rows below that have none.  R1C1 is what makes that safe: relative
+' references re-base per row exactly as a fill-down would, and assigning
+' .FormulaR1C1 writes the formula and nothing else, so no format travels with
+' it the way it would through .Copy.
+'
+' Rows that already hold a formula are never touched, so a hand-edited
+' exception on an existing row survives the load.
+Private Sub FillFormulaColumnsDown( _
+    ByVal ws As Worksheet, _
+    ByVal firstRow As Long, _
+    ByVal lastRow As Long, _
+    ByVal lastColumn As Long, _
+    ByVal ownedCols As Variant)
+
+    Dim c As Long
+    Dim colL As String
+    Dim lastFml As Long
+
+    If lastRow < firstRow Then Exit Sub
+
+    For c = 1 To lastColumn
+
+        colL = ColLetterFromNumber(c)
+
+        If Not IsOwnedColumn(colL, ownedCols) Then
+
+            lastFml = LastFormulaRowInColumn(ws, colL, firstRow, lastRow)
+
+            If lastFml >= firstRow And lastFml < lastRow Then
+
+                ws.Range(colL & (lastFml + 1) & ":" & colL & lastRow).FormulaR1C1 = _
+                    ws.Range(colL & lastFml).FormulaR1C1
+
+            End If
+
+        End If
+
+    Next c
+
+End Sub
+
+
+Private Function IsOwnedColumn( _
+    ByVal col As String, _
+    ByVal cols As Variant) As Boolean
+
+    Dim i As Long
+
+    For i = LBound(cols) To UBound(cols)
+        If UCase$(CStr(cols(i))) = UCase$(col) Then
+            IsOwnedColumn = True
+            Exit Function
+        End If
+    Next i
+
+End Function
+
+
+' Write a contract-detail value only where doing so cannot destroy anything:
+' the cell must be empty, and the column must not be formula-driven on the row
+' above.  A column fed by BDP is therefore never written, even when a
+' particular cell in it happens to be blank because Bloomberg has not answered.
+Private Sub FillSpecIfSafe( _
+    ByVal ws As Worksheet, _
+    ByVal r As Long, _
+    ByVal col As String, _
+    ByVal v As Variant, _
+    ByVal columnIsFormulaDriven As Boolean)
+
+    If columnIsFormulaDriven Then Exit Sub
+    If IsEmpty(v) Then Exit Sub
+    If Len(CStr(v)) = 0 Then Exit Sub
+    If ws.Cells(r, colNum(col)).HasFormula Then Exit Sub
+    If CleanText(ws.Cells(r, colNum(col)).value) <> "" Then Exit Sub
+
+    ws.Cells(r, colNum(col)).value = v
+
+End Sub
+
+
+Private Function AppendCoverageFuturesRowsToFutures( _
+    ByVal wsFut As Worksheet) As Long
+
+    Dim wsMap As Worksheet
+    Dim lastMapRow As Long
+    Dim mapRow As Long
+    Dim n As Long
+    Dim buf As Variant
+    Dim colCount As Long
+    Dim lastFutRow As Long
+
+    Dim linkedISIN As String
+    Dim futureLabel As String
+    Dim futureCode As String
+    Dim hedgeSource As String
+
+    Set wsMap = EnsureCoverageFuturesSheet()
+
+    ' Buffer stays full width so it can be indexed by colNum(); only the owned
+    ' columns are ever written out of it.
+    colCount = colNum(FCOL_LINK_SOURCE)
+
+    ' Clear as far as a previous, larger run could have reached, so contracts
+    ' dropped since then do not survive as stale rows - but ONLY in the columns
+    ' this module owns.  The market-data block is left alone.
+    lastFutRow = LastFutureDataRow(wsFut)
+
+    ClearOwnedColumns wsFut, DATA_ROW, _
+        SheetClearLastRow(wsFut, DATA_ROW, lastFutRow), FuturesOwnedColumns()
+
+    lastMapRow = LastRowInColumn(wsMap, CFCOL_SOURCEROW, DATA_ROW)
+    If lastMapRow < DATA_ROW Then Exit Function
+
+    ReDim buf(1 To lastMapRow - DATA_ROW + 1, 1 To colCount)
+
+    For mapRow = DATA_ROW To lastMapRow
+
+        futureCode = CleanText(wsMap.Cells(mapRow, colNum(CFCOL_FUTURECODE)).value)
+
+        If Len(futureCode) > 0 Then
+
+            linkedISIN = UCase$(CleanText(wsMap.Cells(mapRow, colNum(CFCOL_LINKEDISIN)).value))
+            futureLabel = CleanText(wsMap.Cells(mapRow, colNum(CFCOL_FUTURELABEL)).value)
+
+            hedgeSource = CleanText(wsMap.Cells(mapRow, colNum(CFCOL_HEDGE_SOURCE)).value)
+
+            ' A row with no source tag predates the two-book split.  Default it
+            ' to Tx Juro rather than leaving it blank: blank matches NEITHER
+            ' side of the RTJ/RT split, so the row would carry risk no bond can
+            ' see.
+            If Len(hedgeSource) = 0 Then hedgeSource = HEDGE_SOURCE_RTJ
+
+            n = n + 1
+
+            buf(n, colNum(FCOL_CONTRACTCODE)) = futureCode
+            buf(n, colNum(FCOL_CCY)) = CleanText(wsMap.Cells(mapRow, colNum(CFCOL_CCY)).value)
+            buf(n, colNum(FCOL_CONTRACTS)) = wsMap.Cells(mapRow, colNum(CFCOL_CONTRACTS)).value
+            buf(n, colNum(FCOL_PORTFOLIO)) = CleanText(wsMap.Cells(mapRow, colNum(CFCOL_COVERAGERELATION)).value)
+            buf(n, colNum(FCOL_LINKEDISIN)) = linkedISIN
+            buf(n, colNum(FCOL_STATUS)) = CleanText(wsMap.Cells(mapRow, colNum(CFCOL_IMPORTSTATUS)).value)
+            buf(n, colNum(FCOL_COVERAGE_SOURCEROW)) = wsMap.Cells(mapRow, colNum(CFCOL_SOURCEROW)).value
+            buf(n, colNum(FCOL_COVERAGERELATION)) = CleanText(wsMap.Cells(mapRow, colNum(CFCOL_COVERAGERELATION)).value)
+            buf(n, colNum(FCOL_FUTURELABEL)) = futureLabel
+            buf(n, colNum(FCOL_HEDGETYPE)) = CleanText(wsMap.Cells(mapRow, colNum(CFCOL_HEDGETYPE)).value)
+            buf(n, colNum(FCOL_COVERAGE_STARTDATE)) = wsMap.Cells(mapRow, colNum(CFCOL_STARTDATE)).value
+            buf(n, colNum(FCOL_COVERAGEINFO_D)) = CleanText(wsMap.Cells(mapRow, colNum(CFCOL_COVERAGEINFO_D)).value)
+            buf(n, colNum(FCOL_HEDGE_SOURCE)) = hedgeSource
+            buf(n, colNum(FCOL_COVERAGE_BPV)) = wsMap.Cells(mapRow, colNum(CFCOL_BPV)).value
+            buf(n, colNum(FCOL_LINK_SOURCE)) = CleanText(wsMap.Cells(mapRow, colNum(CFCOL_LINK_SOURCE)).value)
+
+            ' Hedge_Class.  This column was DECLARED and never written - the
+            ' constant had no other reference anywhere in the module - so it
+            ' has been blank on every row this loader has ever produced.
+            ' PNL_Attribution filters both futures DV01 columns and
+            ' Futures_Match_Count on Hedge_Class="RATES", and the Dashboard
+            ' splits rates from FX on it too, so a blank column meant every
+            ' futures hedge summed to zero no matter what else was right.
+            buf(n, colNum(FCOL_HEDGE_CLASS)) = HedgeClassFor( _
+                CleanText(wsMap.Cells(mapRow, colNum(CFCOL_HEDGETYPE)).value), _
+                futureLabel)
+
+            ' Bonds!FutLink.  The label, not the bare code, so a bond covered by
+            ' "OE1 #163" and "OE1 #171" shows both.
+            QueueBondLink linkedISIN, futureLabel, True
+
+        End If
+
+    Next mapRow
+
+    If n > 0 Then
+
+        WriteOwnedColumns wsFut, DATA_ROW, buf, n, FuturesOwnedColumns()
+
+        ' Contract detail that used to come from OPICS.  Written only into
+        ' cells that are empty on a column that is not formula-driven.
+        FillFuturesContractSpec wsFut, DATA_ROW, DATA_ROW + n - 1
+
+        ' Let the sheet's own formulas reach the rows just added.
+        FillFormulaColumnsDown wsFut, DATA_ROW, DATA_ROW + n - 1, _
+            colNum(FCOL_LINK_SOURCE), FuturesOwnedColumns()
+
+    End If
+
+    AppendCoverageFuturesRowsToFutures = n
+
+End Function
+
+
+' Which side of the book a futures hedge belongs to.
+'
+' Both Hedge Risco books are interest-rate books, so RATES is the default and
+' an FX hedge has to say so.  The two strings are the ones PNL_Attribution and
+' modDashboard already filter on; they are not free text.
+Private Function HedgeClassFor( _
+    ByVal hedgeType As String, _
+    ByVal futureLabel As String) As String
+
+    Dim t As String
+
+    t = UCase$(hedgeType & " " & futureLabel)
+
+    If InStr(t, "FX") > 0 _
+       Or InStr(t, "CAMBIAL") > 0 _
+       Or InStr(t, "CAMBIO") > 0 _
+       Or InStr(t, "CURRENCY") > 0 Then
+        HedgeClassFor = HEDGE_CLASS_FX
+    Else
+        HedgeClassFor = HEDGE_CLASS_RATES
+    End If
+
+End Function
+
+
+Private Function AppendSwapMapRowsToSwaps(ByVal wsSw As Worksheet) As Long
+
+    Dim wsMap As Worksheet
+    Dim lastMapRow As Long
+    Dim mapRow As Long
+    Dim n As Long
+    Dim buf As Variant
+    Dim colCount As Long
+    Dim lastSwRow As Long
+    Dim seen As Object
+
+    Dim directId As String
+    Dim fixedId As String
+    Dim floatId As String
+    Dim linkedISIN As String
+    Dim coverageRelation As String
+    Dim idSource As String
+    Dim baseSwapId As String
+    Dim mappingRowId As String
+    Dim sourceRow As String
+    Dim notional As Variant
+    Dim ccy As String
+    Dim counterparty As String
+    Dim curveType As String
+
+    Set wsMap = EnsureSwapMapSheet()
+    Set seen = CreateObject("Scripting.Dictionary")
+
+    colCount = colNum(WCOL_LINK_SOURCE)
+
+    lastSwRow = LastSwapDataRow(wsSw)
+
+    ' Owned columns only.  This used to clear A:BP outright, which on the real
+    ' sheet took out DV01 BBG, the whole BQL block, OIS, DF, the annuities and
+    ' FX along with it.
+    ClearOwnedColumns wsSw, DATA_ROW, _
+        SheetClearLastRow(wsSw, DATA_ROW, lastSwRow), SwapsOwnedColumns()
+
+    lastMapRow = LastRowInColumn(wsMap, SMCOL_SOURCEROW, DATA_ROW)
+    If lastMapRow < DATA_ROW Then Exit Function
+
+    ReDim buf(1 To lastMapRow - DATA_ROW + 1, 1 To colCount)
+
+    For mapRow = DATA_ROW To lastMapRow
+
+        sourceRow = IdText(wsMap.Cells(mapRow, colNum(SMCOL_SOURCEROW)).value)
+        coverageRelation = CleanText(wsMap.Cells(mapRow, colNum(SMCOL_COVERAGERELATION)).value)
+        linkedISIN = UCase$(CleanText(wsMap.Cells(mapRow, colNum(SMCOL_LINKEDISIN)).value))
+        idSource = UCase$(CleanText(wsMap.Cells(mapRow, colNum(SMCOL_SWAP_ID_SOURCE)).value))
+
+        directId = IdText(wsMap.Cells(mapRow, colNum(SMCOL_SWAP_DIRECT_ID)).value)
+        fixedId = IdText(wsMap.Cells(mapRow, colNum(SMCOL_FIXED_LEG_ID)).value)
+        floatId = IdText(wsMap.Cells(mapRow, colNum(SMCOL_FLOAT_LEG_ID)).value)
+
+        ' Prefer the direct Bloomberg swap id; then the leg pair; then a
+        ' traceable source-row id, so a swap with no Bloomberg identity still
+        ' gets a row that can be found in the source book.
+        If Len(directId) > 0 Then
+            baseSwapId = directId
+        ElseIf Len(fixedId) > 0 Or Len(floatId) > 0 Then
+            baseSwapId = "LEGS_" & fixedId & "_" & floatId
+        Else
+            baseSwapId = idSource & "_ROW_" & sourceRow
+        End If
+
+        ' One swap can hedge several bonds, and one source row can hold both a
+        ' plain and a synthetic alternative, so the row id has to carry all
+        ' four parts to stay unique.
+        mappingRowId = idSource & "|" & baseSwapId & "|" & linkedISIN & "|" & sourceRow
+
+        If Len(linkedISIN) > 0 And Not seen.Exists(mappingRowId) Then
+
+            seen.Add mappingRowId, True
+
+            notional = wsMap.Cells(mapRow, colNum(SMCOL_NOTIONAL)).value
+            ccy = CleanText(wsMap.Cells(mapRow, colNum(SMCOL_CCY)).value)
+            counterparty = CleanText(wsMap.Cells(mapRow, colNum(SMCOL_COUNTERPARTY)).value)
+
+            n = n + 1
+
+            buf(n, colNum(WCOL_DEALID)) = TextSafe(mappingRowId)
+            buf(n, colNum(WCOL_CCY)) = ccy
+            buf(n, colNum(WCOL_NOTIONAL)) = notional
+            buf(n, colNum(WCOL_STARTDATE)) = wsMap.Cells(mapRow, colNum(SMCOL_STARTDATE)).value
+            buf(n, colNum(WCOL_ENDDATE)) = wsMap.Cells(mapRow, colNum(SMCOL_ENDDATE)).value
+            buf(n, colNum(WCOL_PORTFOLIO)) = coverageRelation
+            buf(n, colNum(WCOL_LINKEDISIN)) = TextSafe(linkedISIN)
+            buf(n, colNum(WCOL_CPTY)) = counterparty
+            buf(n, colNum(WCOL_STATUS)) = "BQL mapping imported"
+            buf(n, colNum(WCOL_PNL_SOURCE)) = "BQL_PENDING"
+            buf(n, colNum(WCOL_AF_STATUS)) = "BQL mapping imported"
+            buf(n, colNum(WCOL_BBG_SWAP_DIRECT_ID)) = TextSafe(directId)
+            buf(n, colNum(WCOL_BBG_FIXED_LEG_ID)) = TextSafe(fixedId)
+            buf(n, colNum(WCOL_BBG_FLOAT_LEG_ID)) = TextSafe(floatId)
+            buf(n, colNum(WCOL_SWAP_ID_SOURCE)) = idSource
+            buf(n, colNum(WCOL_COVERAGERELATION)) = coverageRelation
+            buf(n, colNum(WCOL_SWAPMAP_SOURCEROW)) = sourceRow
+            buf(n, colNum(WCOL_SWAPMAP_CLASS)) = "SWAP"
+            buf(n, colNum(WCOL_SWAPMAP_STATUS)) = _
+                CleanText(wsMap.Cells(mapRow, colNum(SMCOL_IMPORTSTATUS)).value)
+            buf(n, colNum(WCOL_MAP_NOTIONAL)) = notional
+            buf(n, colNum(WCOL_MAP_CCY)) = ccy
+            buf(n, colNum(WCOL_MAP_COUNTERPARTY)) = counterparty
+            buf(n, colNum(WCOL_NOTIONAL_FINAL)) = Abs(CDblSafe(notional))
+            buf(n, colNum(WCOL_NOTIONAL_SOURCE)) = _
+                CleanText(wsMap.Cells(mapRow, colNum(SMCOL_NOTIONAL_SOURCE)).value)
+            buf(n, colNum(WCOL_LINK_SOURCE)) = _
+                CleanText(wsMap.Cells(mapRow, colNum(SMCOL_LINK_SOURCE)).value)
+
+            ' FloatCurve_Type was never written by this module either.
+            ' Swap_Curve_Model_PnL switches on it: "ESTR"/"SOFR" take the
+            ' risk-free move, "EURIBOR" takes the swap move, and anything the
+            ' formula does not recognise contributes ZERO to the model PnL
+            ' without saying so.  "UNKNOWN" is the one value it treats as a
+            ' question rather than a zero - it blanks the whole cell, which
+            ' drops the row out of the headline instead of understating it.
+            ' So an undetermined curve is written as UNKNOWN, never left blank.
+            curveType = FloatCurveTypeFor(ccy, floatId, directId)
+            buf(n, colNum(WCOL_FLOATCURVE_TYPE)) = curveType
+
+            If curveType = "UNKNOWN" Then mUnknownCurveCount = mUnknownCurveCount + 1
+
+            ' PayFixed is deliberately NOT written.  It came only from OPICS,
+            ' which this module no longer uses, and there is no pay/receive
+            ' column in either coverage book's constants to read it from.  A
+            ' guessed sign here flips the hedge, so the cell is left empty and
+            ' the gap is reported at the end rather than filled with a coin
+            ' flip.  Name the column in the Tx Juro book and it gets read.
+
+            ' Bonds!SwapLink carries the PLAIN swaps only.  A synthetic is an
+            ' alternative to the plain swap on the same relation, not a second
+            ' hedge, so listing it on the bond row would read as double cover.
+            ' Synthetics stay fully mapped in SwapMap, on Swaps, and through
+            ' Swaps!LinkedISIN + Swaps!Swap_ID_Source.
+            If idSource = "PLAIN" Then
+                QueueBondLink linkedISIN, baseSwapId, False
+            End If
+
+        End If
+
+    Next mapRow
+
+    If n > 0 Then
+
+        WriteOwnedColumns wsSw, DATA_ROW, buf, n, SwapsOwnedColumns()
+
+        FillFormulaColumnsDown wsSw, DATA_ROW, DATA_ROW + n - 1, _
+            colNum(WCOL_LINK_SOURCE), SwapsOwnedColumns()
+
+    End If
+
+    AppendSwapMapRowsToSwaps = n
+
+End Function
+
+
+' Which curve a swap's floating leg is measured against.
+'
+' Read from the Bloomberg leg identifiers where they say, then from the
+' currency's overnight index as a last resort, and "UNKNOWN" when neither
+' settles it.  Returning UNKNOWN is deliberate: Swap_Curve_Model_PnL tests for
+' exactly that string and blanks its result, so an unresolved swap removes its
+' bond from the headline rather than quietly contributing a zero to it.
+Private Function FloatCurveTypeFor( _
+    ByVal ccy As String, _
+    ByVal floatLegId As String, _
+    ByVal directId As String) As String
+
+    Dim t As String
+
+    t = UCase$(floatLegId & " " & directId)
+
+    If InStr(t, "ESTR") > 0 Or InStr(t, "ESTER") > 0 Or InStr(t, "EONIA") > 0 Then
+        FloatCurveTypeFor = "ESTR"
+    ElseIf InStr(t, "SOFR") > 0 Then
+        FloatCurveTypeFor = "SOFR"
+    ElseIf InStr(t, "EURIB") > 0 Or InStr(t, "EUR003M") > 0 Or InStr(t, "EUR006M") > 0 Then
+        FloatCurveTypeFor = "EURIBOR"
+    ElseIf UCase$(Trim$(ccy)) = "USD" Then
+        FloatCurveTypeFor = "SOFR"
+    Else
+        FloatCurveTypeFor = "UNKNOWN"
+    End If
+
+End Function
+
+
+' =============================================================================
+' FUTURES CONTRACT SPECIFICATION
+'
+' This replaces the OPICS block that used to sit here.
+'
+' What OPICS was actually asked for was small: exchange, face value, delivery
+' date, CTD ISIN, CTD conversion factor and average entry price for the futures,
+' plus PayFixed for the swaps.  Everything that decides WHICH hedges exist and
+' WHAT they cover came, and still comes, from the two Hedge Risco books.
+'
+' Four of those six fields are already on the sheet as Bloomberg formulas,
+' driven off Futures!BBG_Ticker:
+'
+'     BBG_Ticker    = VLOOKUP(ContractCode, FutMapTable, 2, FALSE)
+'     DelivDate     = BDP(ticker, "LAST_TRADEABLE_DT") / "FUT_DLV_DT"
+'     CTD_Ticker    -> CTD_DirtyPx_T0, and CTD_ISIN / CTD_CF beside it
+'     FUT_VAL_PT    = BDP(ticker, "FUT_VAL_PT")
+'     HedgeUnitDV01 = BDP(ticker, "FUT_PX_VAL_BP")
+'
+' So the database was being asked for numbers the workbook already had a live
+' source for.  Writing them from here would also mean writing a VALUE into a
+' formula cell, which is the thing this module must not do.
+'
+' That leaves exchange and face value, which are properties of the CONTRACT
+' ROOT and do not change - a Bund future is 100,000 EUR on Eurex whichever
+' delivery is front.  They are a table, not a query.
+'
+' The contract code the coverage books give us is the root only: the label
+' "OE1 #163" resolves through FutureCodeFromCoverageLabel to "OE", with no
+' delivery month.  That is the correct key for this table, and it is also why
+' the delivery date has to come from the ticker rather than from the code.
+'
+' Values are written through FillSpecIfSafe: empty cell, non-formula column,
+' or nothing happens.
+'
+' TO ADD A CONTRACT: one line below.  An unknown root is not an error - the
+' row loads, its two spec cells stay empty, and the Bloomberg chain still
+' prices it off the FutMap ticker.
+' =============================================================================
+
+
+Private Sub FillFuturesContractSpec( _
+    ByVal wsFut As Worksheet, _
+    ByVal firstRow As Long, _
+    ByVal lastRow As Long)
+
+    Dim r As Long
+    Dim root As String
+    Dim spec As Variant
+    Dim exchangeIsFormula As Boolean
+    Dim faceValueIsFormula As Boolean
+
+    If lastRow < firstRow Then Exit Sub
+
+    ' Decided ONCE per column, from the first data row, rather than per cell.
+    ' A column fed by BDP is out of bounds for its whole length, including the
+    ' rows where Bloomberg has not answered yet and the cell looks empty.
+    exchangeIsFormula = ColumnIsFormulaDriven(wsFut, FCOL_EXCHANGE, firstRow, lastRow)
+    faceValueIsFormula = ColumnIsFormulaDriven(wsFut, FCOL_FACEVALUE, firstRow, lastRow)
+
+    If exchangeIsFormula And faceValueIsFormula Then Exit Sub
+
+    For r = firstRow To lastRow
+
+        root = UCase$(CleanText(wsFut.Cells(r, colNum(FCOL_CONTRACTCODE)).value))
+
+        If Len(root) > 0 Then
+
+            spec = FutureSpec(root)
+
+            If Not IsEmpty(spec) Then
+                FillSpecIfSafe wsFut, r, FCOL_EXCHANGE, spec(0), exchangeIsFormula
+                FillSpecIfSafe wsFut, r, FCOL_FACEVALUE, spec(1), faceValueIsFormula
+            End If
+
+        End If
+
+    Next r
+
+End Sub
+
+
+' Array(Exchange, FaceValue) for a contract root, or Empty if it is not listed.
+'
+' Face value is the contract's notional in its own currency - the unit the
+' desk's DV01 per contract is quoted against - not a EUR amount.
+Private Function FutureSpec(ByVal root As String) As Variant
+
+    Select Case UCase$(Trim$(root))
+
+        ' --- Eurex, EUR ---
+        Case "DU", "FGBS"          ' Schatz, 2y
+            FutureSpec = Array("EUX", 100000)
+        Case "OE", "FGBM"          ' Bobl, 5y
+            FutureSpec = Array("EUX", 100000)
+        Case "RX", "FGBL"          ' Bund, 10y
+            FutureSpec = Array("EUX", 100000)
+        Case "UB", "FGBX"          ' Buxl, 30y
+            FutureSpec = Array("EUX", 100000)
+        Case "OAT"                 ' French 10y
+            FutureSpec = Array("EUX", 100000)
+        Case "IK"                  ' Italian BTP 10y
+            FutureSpec = Array("EUX", 100000)
+        Case "BTS"                 ' Italian BTP short
+            FutureSpec = Array("EUX", 100000)
+
+        ' --- CBOT, USD ---
+        Case "TU"                  ' 2y note
+            FutureSpec = Array("CBT", 200000)
+        Case "FV"                  ' 5y note
+            FutureSpec = Array("CBT", 100000)
+        Case "TY"                  ' 10y note
+            FutureSpec = Array("CBT", 100000)
+        Case "UXY"                 ' ultra 10y
+            FutureSpec = Array("CBT", 100000)
+        Case "US"                  ' classic bond
+            FutureSpec = Array("CBT", 100000)
+        Case "WN"                  ' ultra bond
+            FutureSpec = Array("CBT", 100000)
+
+        ' --- ICE, GBP ---
+        Case "G", "R"              ' long gilt
+            FutureSpec = Array("ICE", 100000)
+
+        Case Else
+            FutureSpec = Empty
+
+    End Select
+
+End Function
+
+
+' Is this column driven by formulas rather than written values?
+'
+' Answered from the column as a whole, not from one cell: a BDP column with a
+' blank row in it is still a formula column, and writing a value into that
+' blank would replace a live query with a frozen number.
+Private Function ColumnIsFormulaDriven( _
+    ByVal ws As Worksheet, _
+    ByVal col As String, _
+    ByVal firstRow As Long, _
+    ByVal lastRow As Long) As Boolean
+
+    ColumnIsFormulaDriven = _
+        (LastFormulaRowInColumn(ws, col, firstRow, lastRow) >= firstRow)
+
+End Function
+
+
+
+
+' =============================================================================
+' GENERIC HELPERS
+' =============================================================================
+
+
+' Column letter -> column number, computed rather than asked of a Range.
+'
+' The staged writes below call this a few thousand times per load; going
+' through ThisWorkbook.Worksheets(1).Range(...).Column each time is a COM round
+' trip for arithmetic, and it also made a pure string helper depend on the
+' first sheet of the workbook still being a worksheet.
+Private Function colNum(ByVal colLetters As String) As Long
+
+    Dim i As Long
+    Dim n As Long
+    Dim ch As Long
+
+    For i = 1 To Len(colLetters)
+        ch = Asc(UCase$(Mid$(colLetters, i, 1))) - 64
+        If ch < 1 Or ch > 26 Then Exit Function
+        n = n * 26 + ch
+    Next i
+
+    colNum = n
+
+End Function
+
+
+Private Function CDblSafe(ByVal v As Variant) As Double
+    On Error GoTo Zero
+    If IsNull(v) Or v = "" Then CDblSafe = 0 Else CDblSafe = CDbl(v)
+    Exit Function
+Zero:
+    CDblSafe = 0
+End Function
+
+
+Private Function CleanText(ByVal v As Variant) As String
+    On Error GoTo Blank
+    If IsNull(v) Then Exit Function
+    If IsError(v) Then Exit Function
+    CleanText = Trim$(CStr(v))
+    Exit Function
+Blank:
+    CleanText = ""
+End Function
+
+
+' An identifier, never in scientific notation.
+Private Function IdText(ByVal v As Variant) As String
+
+    If IsError(v) Then Exit Function
+    If IsNull(v) Then Exit Function
+    If IsEmpty(v) Then Exit Function
+
+    If VarType(v) = vbString Then
+        IdText = CleanText(v)
+        Exit Function
+    End If
+
+    ' Excel or ADO may already have turned a long id into a number.  This
+    ' cannot recover digits it has lost, but it stops the display drifting
+    ' further into E+ notation.
+    If IsNumeric(v) Then
+        IdText = Format$(CDbl(v), "0")
+        Exit Function
+    End If
+
+    IdText = CleanText(v)
+
+End Function
+
+
+Private Function LastBondDataRow(ByVal ws As Worksheet) As Long
+    LastBondDataRow = LastRowInColumn(ws, BCOL_ISIN, BOND_DATA_ROW)
+End Function
+
+
+Private Function LastFutureDataRow(ByVal ws As Worksheet) As Long
+    LastFutureDataRow = LastRowInColumn(ws, FCOL_CONTRACTCODE, DATA_ROW)
+End Function
+
+
+Private Function LastSwapDataRow(ByVal ws As Worksheet) As Long
+    LastSwapDataRow = LastRowInColumn(ws, WCOL_DEALID, DATA_ROW)
+End Function
+
+
+' Last non-empty row of `keyCol` at or below `firstDataRow`, or
+' firstDataRow - 1 when the sheet holds no data.
+Private Function LastRowInColumn( _
+    ByVal ws As Worksheet, _
+    ByVal keyCol As String, _
+    ByVal firstDataRow As Long) As Long
+
+    Dim r As Long
+
+    On Error GoTo Empty_
+
+    r = ws.Cells(ws.rows.Count, colNum(keyCol)).End(xlUp).Row
+
+    If r < firstDataRow Then GoTo Empty_
+
+    LastRowInColumn = r
+    Exit Function
+
+Empty_:
+    LastRowInColumn = firstDataRow - 1
+
+End Function
+
+
+' How far a clear must reach.
+'
+' Deliberately PAST the current data: if yesterday loaded 40 futures and today
+' loads 38, rows 39-40 still hold yesterday's positions and must go, or the
+' attribution keeps reporting two hedges the desk no longer has.
+'
+' The lookahead is a FIXED number of rows.  It used to be taken from
+' ws.UsedRange, which made the clear as large as whatever the sheet's used
+' range had grown to - and the old blanket NumberFormat writes had grown it to
+' row 50,004, so every clear became a 50,000-row x 67-column operation.  That
+' is what took Excel down when the button was pressed.
+Private Function SheetClearLastRow( _
+    ByVal ws As Worksheet, _
+    ByVal firstDataRow As Long, _
+    ByVal lastDataRow As Long) As Long
+
+    Dim n As Long
+
+    n = lastDataRow + CLEAR_LOOKAHEAD_ROWS
+
+    If n < firstDataRow Then n = firstDataRow
+
+    If n > firstDataRow + MAX_SHEET_ROWS - 1 Then
+        n = firstDataRow + MAX_SHEET_ROWS - 1
+    End If
+
+    SheetClearLastRow = n
+
+End Function
+
+
+' T1 = last business day, T0 = the one before it.  Only when the desk has not
+' pinned the dates by hand.
+Private Sub Update_Config_Dates_5pmUTC(ByVal wsCfg As Worksheet)
+
+    Dim t1 As Date
+    Dim t0 As Date
+
+    If CleanText(wsCfg.Range(CFG_AUTO_DATE).value) <> "AUTO" Then Exit Sub
+
+    t1 = PrevBusinessDay(Date)
+    t0 = PrevBusinessDay(t1)
+
+    wsCfg.Range(CFG_T1_DATE).value = t1
+    wsCfg.Range(CFG_T0_DATE).value = t0
+
+End Sub
+
+
+Private Function PrevBusinessDay(ByVal d As Date) As Date
+
+    Dim x As Date
+
+    x = d - 1
+
+    Do While Weekday(x, vbMonday) >= 6      ' Saturday or Sunday
+        x = x - 1
+    Loop
+
+    PrevBusinessDay = x
+
+End Function
+
+
+Private Function CaptureErrInfo() As String
+    CaptureErrInfo = "Error " & CStr(Err.Number) & ": " & Err.Description
+End Function
+
+
+' =============================================================================
+' LOAD_OPICS_HEDGES  -  the only button in this module
+'
+' Run order:
+'
+'   1  read Hedge Risco Tx Juro into its scratch sheet
+'   2  index its coverage relations, then build SwapMap and CoverageFutures
+'   3  read Hedge Risco Total into its own scratch sheet
+'   4  index ITS coverage relations, then append to CoverageFutures
+'   5  write the Swaps sheet from SwapMap, the Futures sheet from CoverageFutures
+'   6  stamp Bonds!SwapLink / Bonds!FutLink
+'   7  enrich from OPICS: PayFixed for the swaps, operational fields for the futures
+'
+' Step 3 failing is a PARTIAL load, not a dead run: the Tx Juro positions are
+' already mapped and are still worth having, so the failure is reported in the
+' completion box rather than thrown.
+'
+' Excel state (calculation, screen updating, events, alerts, link prompts) is
+' saved before anything is touched and restored on EVERY exit path, including
+' the error one.  The completion box is shown AFTER the restore, so a run can
+' never leave the application with events off waiting on a modal dialog.
+' =============================================================================
+
+
+' =============================================================================
+' THE BUTTON
+'
+' Assign a Form Control button to Load_Hedges - NOT to LoadHedges_Step2.
+'
+' Excel's "Assign Macro" dialog lists only Public Subs that take NO parameters
+' at all.  An Optional one still disqualifies a procedure, so
+' LoadHedges_Step2(Optional silent As Boolean) and the old LoadOPICS_Hedges
+' have never appeared in that list and never will, no matter how many times the
+' button is redrawn.  That is why a button could not be attached to this macro.
+'
+' Load_Hedges takes nothing, so it shows up.
+'
+' One caution if the button goes on the Dashboard: modDashboard's build deletes
+' every shape on that sheet whose name does not start with "btnPnl", so either
+' put the button on another sheet or rename it to btnPnlLoadHedges.
+' =============================================================================
+Public Sub Load_Hedges()
+    LoadHedges_Step2 False
+End Sub
+
+
+' Kept as the old name so anything already pointing at it still resolves.
+Public Sub LoadOPICS_Hedges(Optional ByVal silent As Boolean = False)
+    LoadHedges_Step2 silent
+End Sub
+
+
+' Run the layout check on its own, without loading anything.
+'
+' Worth pressing after anyone inserts, deletes or renames a column on Futures
+' or Swaps.  It reads two header rows and writes nothing at all.
+Public Sub Check_Hedge_Layout()
+
+    Dim wb As Workbook
+    Dim bad As String
+
+    On Error GoTo CheckFail
+
+    Set wb = ThisWorkbook
+
+    bad = AssertHedgeSheetHeaders( _
+        RequireSheet(wb, SH_FUTURES), RequireSheet(wb, SH_SWAPS))
+
+    If Len(bad) = 0 Then
+        MsgBox SH_FUTURES & " and " & SH_SWAPS & " match the layout this " & _
+            "macro compiles against." & vbCrLf & vbCrLf & _
+            "42 futures columns and 78 swap columns, all in place.", _
+            vbInformation, "Hedge layout OK"
+    Else
+        MsgBox bad, vbExclamation, "Hedge layout has moved"
+    End If
+
+    Exit Sub
+
+CheckFail:
+
+    MsgBox "Could not check the layout." & vbCrLf & vbCrLf & CaptureErrInfo(), _
+        vbCritical, "Hedge layout check failed"
+
+End Sub
+
+
+Public Sub LoadHedges_Step2(Optional ByVal silent As Boolean = False)
+
+    Dim wb As Workbook
+    Dim wsCfg As Worksheet
+    Dim wsBnd As Worksheet
+    Dim wsSw As Worksheet
+    Dim wsFut As Worksheet
+    Dim wsCov As Worksheet
+    Dim wsCovTotal As Worksheet
+
+    Dim oldCalc As XlCalculation
+    Dim oldScreen As Boolean
+    Dim oldEvents As Boolean
+    Dim oldAlerts As Boolean
+    Dim oldAskLinks As Boolean
+    Dim stateSaved As Boolean
+
+    Dim rcByRow As Object
+    Dim rcIndex As Object
+
+    Dim swapCount As Long
+    Dim futCount As Long
+    Dim mappedSwapCount As Long
+    Dim mappedFutureCount As Long
+    Dim totalFutureCount As Long
+
+    Dim txJuroError As String
+    Dim totalBookError As String
+    Dim failureMessage As String
+
+
+    On Error GoTo HedgeErr
+
+    Set wb = ThisWorkbook
+
+    ' Named explicitly so a missing sheet says WHICH one, rather than failing
+    ' as an anonymous subscript error inside the first thing that touches it.
+    Set wsCfg = RequireSheet(wb, SH_CONFIG)
+    Set wsBnd = RequireSheet(wb, SH_BONDS)
+    Set wsSw = RequireSheet(wb, SH_SWAPS)
+    Set wsFut = RequireSheet(wb, SH_FUTURES)
+
+    oldCalc = Application.Calculation
+    oldScreen = Application.ScreenUpdating
+    oldEvents = Application.EnableEvents
+    oldAlerts = Application.DisplayAlerts
+    oldAskLinks = Application.AskToUpdateLinks
+    stateSaved = True
+
+    Application.Calculation = xlCalculationManual
+    Application.ScreenUpdating = False
+    Application.EnableEvents = False
+    Application.DisplayAlerts = False
+    Application.AskToUpdateLinks = False
+
+    Application.StatusBar = "Load hedges: preparing..."
+
+    mUnknownCurveCount = 0
+
+    Update_Config_Dates_5pmUTC wsCfg
+
+    ' The layout check runs FIRST, ahead of every read and every write.
+    '
+    ' Every column this module touches is addressed by letter.  If the sheet
+    ' has been re-laid out underneath those letters - which is exactly what
+    ' happened when Swaps gained ten columns at O - the load does not fail, it
+    ' succeeds against the wrong cells: hedge text over market data, and an
+    ' attribution that quietly reports a fully hedged book as unhedged.
+    ' Stopping here is the difference between a message and a wrong number.
+    failureMessage = AssertHedgeSheetHeaders(wsFut, wsSw)
+    If Len(failureMessage) > 0 Then GoTo CleanExit
+
+    If CleanText(wsBnd.Cells(BOND_DATA_ROW, colNum(BCOL_ISIN)).value) = "" Then
+        failureMessage = "No bonds loaded on the " & SH_BONDS & " sheet." & vbCrLf & _
+                         "Load the bonds first - there is nothing to attach a hedge to."
+        GoTo CleanExit
+    End If
+
+    ' =========================================================================
+    ' BOOK 1: HEDGE RISCO TX JURO
+    ' =========================================================================
+    Application.StatusBar = "Load hedges: reading Hedge Risco Tx Juro..."
+
+    Set wsCov = EnsureCoverageSupportSheet()
+
+    ClearCoverageSupportSheet
+
+    txJuroError = CopyCoverageBook( _
+        SWAP_ID_BOOK_PATH, SWAP_ID_BOOK_SHEET, _
+        SWAP_ID_FIRST_ROW, SWAP_ID_LAST_ROW, _
+        HEDGE_RISCO_COPY_LAST_COL, HEDGE_RISCO_FORMULA_A_COL, wsCov)
+
+    ' Book 1 failing STOPS the run, before anything is rewritten.
+    '
+    ' It is the book that owns the swaps and most of the futures, so carrying
+    ' on would clear the Swaps and Futures sheets and refill them from an empty
+    ' map - the desk would lose every hedge because a mapped drive blipped.
+    ' Book 2 failing is different, and is handled as a partial load below.
+    If Len(txJuroError) > 0 Then
+        failureMessage = "Hedge Risco Tx Juro could not be read, so nothing was " & _
+            "changed:" & vbCrLf & vbCrLf & txJuroError & vbCrLf & vbCrLf & _
+            "The " & SH_SWAPS & " and " & SH_FUTURES & " sheets are exactly as " & _
+            "they were."
+        GoTo CleanExit
+    End If
+
+    Application.StatusBar = "Load hedges: indexing Tx Juro coverage relations..."
+
+    ' Built ONCE and shared by the swap and futures passes, so the two cannot
+    ' disagree about which relation a row belongs to.
+    Set rcByRow = BuildCoverageRelationByRow( _
+        wsCov, SWAP_ID_FIRST_ROW, SWAP_ID_LAST_ROW, _
+        RTJ_RC_COL, HEDGE_RISCO_FORMULA_A_COL, HEDGE_RISCO_COPY_LAST_COL)
+
+    Set rcIndex = BuildCoverageRelationIndex( _
+        wsCov, SWAP_ID_FIRST_ROW, SWAP_ID_LAST_ROW, RTJ_ISIN_COL, rcByRow)
+
+    Application.StatusBar = "Load hedges: building SwapMap..."
+    mappedSwapCount = BuildSwapMapFromCoverageSupport(rcByRow, rcIndex)
+
+    ' This also CLEARS CoverageFutures, which is why it must run before the
+    ' Total pass appends to it: without it the Total rows would pile up under
+    ' yesterday's Tx Juro rows on every run.
+    Application.StatusBar = "Load hedges: building CoverageFutures..."
+    mappedFutureCount = BuildCoverageFuturesMapFromCoverageSupport(rcByRow, rcIndex)
+
+    ClearCoverageSupportSheet
+
+    ' =========================================================================
+    ' BOOK 2: HEDGE RISCO TOTAL
+    '
+    ' Its own scan, its own columns, its own #RC index.  The two books number
+    ' their relations independently, so nothing from book 1 is in scope here.
+    ' =========================================================================
+    Application.StatusBar = "Load hedges: reading Hedge Risco Total..."
+
+    Set wsCovTotal = EnsureCoverageTotalSupportSheet()
+
+    ClearCoverageTotalSupportSheet
+
+    totalBookError = CopyCoverageBook( _
+        HEDGE_TOTAL_BOOK_PATH, HEDGE_TOTAL_BOOK_SHEET, _
+        HEDGE_TOTAL_FIRST_ROW, HEDGE_TOTAL_LAST_ROW, _
+        HEDGE_TOTAL_COPY_LAST_COL, HEDGE_TOTAL_FORMULA_A_COL, wsCovTotal)
+
+    If Len(totalBookError) = 0 Then
+
+        Application.StatusBar = "Load hedges: indexing Total coverage relations..."
+
+        Set rcByRow = BuildCoverageRelationByRow( _
+            wsCovTotal, HEDGE_TOTAL_FIRST_ROW, HEDGE_TOTAL_LAST_ROW, _
+            RT_RC_COL, HEDGE_TOTAL_FORMULA_A_COL, HEDGE_TOTAL_COPY_LAST_COL)
+
+        Set rcIndex = BuildCoverageRelationIndex( _
+            wsCovTotal, HEDGE_TOTAL_FIRST_ROW, HEDGE_TOTAL_LAST_ROW, _
+            RT_ISIN_COL, rcByRow)
+
+        Application.StatusBar = "Load hedges: appending Total futures..."
+        totalFutureCount = AppendCoverageFuturesMapFromCoverageTotal(rcByRow, rcIndex)
+
+    End If
+
+    ClearCoverageTotalSupportSheet
+
+    mappedFutureCount = mappedFutureCount + totalFutureCount
+
+    ' =========================================================================
+    ' WRITE THE HEDGE SHEETS
+    '
+    ' Nothing above this point has changed Bonds, Swaps or Futures.  Every way
+    ' the run can stop early - no bonds, no ISIN type, book 1 unreachable -
+    ' therefore leaves all three exactly as they were, which is what makes
+    ' "nothing was changed" in the message true rather than nearly true.
+    ' =========================================================================
+    Application.StatusBar = "Load hedges: writing Swaps..."
+
+    ' Index the bonds and clear their two link columns, at the moment the
+    ' rebuild actually starts.  The header row was checked at the top of the
+    ' run and is not written to.
+    BeginBondLinks wsBnd
+
+    swapCount = AppendSwapMapRowsToSwaps(wsSw)
+
+    Application.StatusBar = "Load hedges: writing Futures..."
+    futCount = AppendCoverageFuturesRowsToFutures(wsFut)
+
+    Application.StatusBar = "Load hedges: writing bond coverage links..."
+    FlushBondLinks wsBnd
+
+    ' The OPICS enrichment pass used to run here.  It is gone: what it filled
+    ' in is either already a Bloomberg formula on the Futures sheet or a
+    ' property of the contract root, and both are handled inside the futures
+    ' append itself.  See "FUTURES CONTRACT SPECIFICATION" above.
+
+    wsCfg.Range(CFG_SWAP_CNT).value = swapCount
+    wsCfg.Range(CFG_FUT_CNT).value = futCount
+
+CleanExit:
+
+    On Error Resume Next
+
+    ClearCoverageSupportSheet
+    ClearCoverageTotalSupportSheet
+
+    If stateSaved Then
+        Application.Calculation = oldCalc
+        Application.ScreenUpdating = oldScreen
+        Application.EnableEvents = oldEvents
+        Application.DisplayAlerts = oldAlerts
+        Application.AskToUpdateLinks = oldAskLinks
+    End If
+
+    Application.StatusBar = False
+
+    On Error GoTo 0
+
+    ' Reported only after Excel is back to normal, so a modal box can never be
+    ' waiting while events and screen updating are still switched off.
+    If Not silent Then
+
+        If Len(failureMessage) > 0 Then
+
+            MsgBox failureMessage, vbExclamation, "Load hedges - nothing loaded"
+
+        Else
+
+            MsgBox HedgeLoadReport( _
+                swapCount, futCount, mappedSwapCount, mappedFutureCount, _
+                totalFutureCount, txJuroError, totalBookError), _
+                HedgeLoadIcon(txJuroError, totalBookError), _
+                "Load hedges complete"
+
+        End If
+
+    End If
+
+    Exit Sub
+
+HedgeErr:
+
+    failureMessage = "The hedge load stopped." & vbCrLf & vbCrLf & CaptureErrInfo()
+
+    On Error Resume Next
+
+    ClearCoverageSupportSheet
+    ClearCoverageTotalSupportSheet
+
+    If stateSaved Then
+        Application.Calculation = oldCalc
+        Application.ScreenUpdating = oldScreen
+        Application.EnableEvents = oldEvents
+        Application.DisplayAlerts = oldAlerts
+        Application.AskToUpdateLinks = oldAskLinks
+    End If
+
+    Application.StatusBar = False
+
+    On Error GoTo 0
+
+    If Not silent Then
+        MsgBox failureMessage, vbCritical, "Load hedges failed"
+    End If
+
+End Sub
+
+
+Private Function RequireSheet( _
+    ByVal wb As Workbook, _
+    ByVal sheetName As String) As Worksheet
+
+    Dim ws As Worksheet
+
+    On Error Resume Next
+    Set ws = wb.Worksheets(sheetName)
+    On Error GoTo 0
+
+    If ws Is Nothing Then
+        Err.Raise 9800, "LoadOPICS_Hedges", _
+            "Required sheet not found: " & sheetName
+    End If
+
+    Set RequireSheet = ws
+
+End Function
+
+
+' What the desk needs to know afterwards.
+'
+' The two books are reported SEPARATELY, and so are the bond link counts.  A
+' run where one book was unreachable still loads every position from the other,
+' so the only way to notice is a count that says so - and "22 futures rows
+' loaded" with "0 bonds linked" is a completely different outcome from the same
+' sentence with "18 bonds linked", which the old single total could not show.
+Private Function HedgeLoadReport( _
+    ByVal swapCount As Long, _
+    ByVal futCount As Long, _
+    ByVal mappedSwapCount As Long, _
+    ByVal mappedFutureCount As Long, _
+    ByVal totalFutureCount As Long, _
+    ByVal txJuroError As String, _
+    ByVal totalBookError As String) As String
+
+    Dim s As String
+
+    s = CStr(swapCount) & " swap rows written to " & SH_SWAPS & "." & vbCrLf & _
+        CStr(futCount) & " futures rows written to " & SH_FUTURES & "." & vbCrLf & vbCrLf
+
+    s = s & "SwapMap rows: " & CStr(mappedSwapCount) & vbCrLf
+    s = s & "CoverageFutures rows: " & CStr(mappedFutureCount) & _
+        "  (Hedge Risco Total: " & CStr(totalFutureCount) & ")" & vbCrLf & vbCrLf
+
+    s = s & "Bonds with a swap link: " & CStr(BondLinkCount(False)) & vbCrLf
+    s = s & "Bonds with a futures link: " & CStr(BondLinkCount(True)) & vbCrLf & vbCrLf
+
+    If Len(txJuroError) > 0 Then
+        s = s & "Hedge Risco Tx Juro NOT loaded: " & txJuroError & vbCrLf
+    End If
+
+    If Len(totalBookError) > 0 Then
+        s = s & "Hedge Risco Total NOT loaded: " & totalBookError & vbCrLf
+    End If
+
+    If Len(txJuroError) > 0 Or Len(totalBookError) > 0 Then s = s & vbCrLf
+
+    ' The two gaps left by dropping OPICS.  Stated plainly rather than left
+    ' for the desk to find as a zero somewhere downstream.
+    If mUnknownCurveCount > 0 Then
+        s = s & CStr(mUnknownCurveCount) & " swap rows have FloatCurve_Type " & _
+            "UNKNOWN." & vbCrLf & _
+            "Swap_Curve_Model_PnL blanks those rows rather than guessing," & vbCrLf & _
+            "so their bonds drop out of the headline until the curve is set." & _
+            vbCrLf & vbCrLf
+    End If
+
+    If swapCount > 0 Then
+        s = s & "PayFixed was not written - it came from OPICS and neither" & vbCrLf & _
+            "coverage book carries a pay/receive column yet." & vbCrLf & vbCrLf
+    End If
+
+    s = s & "Check Link_Source on " & SH_FUTURES & " and " & SH_SWAPS & _
+        " to see how each" & vbCrLf & _
+        "row's bond was resolved: RC means the coverage relation decided it."
+
+    HedgeLoadReport = s
+
+End Function
+
+
+Private Function HedgeLoadIcon( _
+    ByVal txJuroError As String, _
+    ByVal totalBookError As String) As Long
+
+    If Len(txJuroError) > 0 Or Len(totalBookError) > 0 Then
+        HedgeLoadIcon = vbExclamation
+    Else
+        HedgeLoadIcon = vbInformation
+    End If
+
+End Function

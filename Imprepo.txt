@@ -1,0 +1,585 @@
+Option Explicit
+
+Public Const DCC_ACT_ACT_ICMA As Integer = 0
+Public Const DCC_ACT_ACT_ISDA As Integer = 1
+Public Const DCC_ACT_365F     As Integer = 2
+Public Const DCC_ACT_360      As Integer = 3
+Public Const DCC_30_360_BOND  As Integer = 4
+Public Const DCC_30E_360      As Integer = 5
+Public Const DCC_30E_360_ISDA As Integer = 6
+
+
+
+Private Function IsLeapYear(y As Integer) As Boolean
+    IsLeapYear = (y Mod 4 = 0 And y Mod 100 <> 0) Or (y Mod 400 = 0)
+End Function
+
+Private Function IsEndOfMonth(d As Date) As Boolean
+    IsEndOfMonth = (Day(d) = Day(DateSerial(Year(d), Month(d) + 1, 0)))
+End Function
+
+Private Function Days30_360_Bond(d1 As Date, d2 As Date) As Double
+    Dim y1 As Integer, m1 As Integer, dd1 As Integer
+    Dim y2 As Integer, m2 As Integer, dd2 As Integer
+    y1 = Year(d1):  m1 = Month(d1):  dd1 = Day(d1)
+    y2 = Year(d2):  m2 = Month(d2):  dd2 = Day(d2)
+    If dd1 = 31 Then dd1 = 30
+    If dd2 = 31 And dd1 = 30 Then dd2 = 30
+    Days30_360_Bond = 360# * (y2 - y1) + 30# * (m2 - m1) + (dd2 - dd1)
+End Function
+
+Private Function Days30E_360(d1 As Date, d2 As Date) As Double
+    Dim y1 As Integer, m1 As Integer, dd1 As Integer
+    Dim y2 As Integer, m2 As Integer, dd2 As Integer
+    y1 = Year(d1):  m1 = Month(d1):  dd1 = Day(d1)
+    y2 = Year(d2):  m2 = Month(d2):  dd2 = Day(d2)
+    If dd1 = 31 Then dd1 = 30
+    If dd2 = 31 Then dd2 = 30
+    Days30E_360 = 360# * (y2 - y1) + 30# * (m2 - m1) + (dd2 - dd1)
+End Function
+
+Private Function Days30E_360_ISDA(d1 As Date, d2 As Date, matDate As Date) As Double
+    Dim y1 As Integer, m1 As Integer, dd1 As Integer
+    Dim y2 As Integer, m2 As Integer, dd2 As Integer
+    y1 = Year(d1):  m1 = Month(d1):  dd1 = Day(d1)
+    y2 = Year(d2):  m2 = Month(d2):  dd2 = Day(d2)
+    If IsEndOfMonth(d1) Then dd1 = 30
+    If IsEndOfMonth(d2) Then
+        If Not (d2 = matDate And Month(d2) = 2) Then dd2 = 30
+    End If
+    Days30E_360_ISDA = 360# * (y2 - y1) + 30# * (m2 - m1) + (dd2 - dd1)
+End Function
+
+Private Function ActActISDA_Fraction(d1 As Date, d2 As Date) As Double
+    Dim y1 As Integer, y2 As Integer
+    Dim dY1 As Long, dY2 As Long
+    y1 = Year(d1): y2 = Year(d2)
+    If y1 = y2 Then
+        ActActISDA_Fraction = (d2 - d1) / IIf(IsLeapYear(y1), 366#, 365#)
+    Else
+        dY1 = DateSerial(y1 + 1, 1, 1) - d1
+        dY2 = d2 - DateSerial(y2, 1, 1)
+        ActActISDA_Fraction = CDbl(dY1) / IIf(IsLeapYear(y1), 366#, 365#) _
+                            + CDbl(y2 - y1 - 1) _
+                            + CDbl(dY2) / IIf(IsLeapYear(y2), 366#, 365#)
+    End If
+End Function
+
+Private Function RepoBasis(repoDCC As Integer) As Double
+    Select Case repoDCC
+        Case DCC_ACT_365F:     RepoBasis = 365#
+        Case DCC_ACT_ACT_ISDA: RepoBasis = 365#   ' approximate; rarely used in repo
+        Case Else:             RepoBasis = 360#    ' Act/360 default
+    End Select
+End Function
+
+Private Function WeightedCouponDays(settleDate As Date, delivDate As Date, _
+                                     matDate As Date, couponRate As Double, _
+                                     freq As Integer) As Double
+    Dim cpnDates As Variant
+    Dim i        As Integer
+    Dim cpnPmt   As Double
+    Dim wcd      As Double
+
+    cpnDates = CouponDatesBetween(settleDate, delivDate, matDate, freq)
+    cpnPmt = (couponRate / freq) * 100
+    wcd = 0
+
+    If Not IsEmpty(cpnDates) Then
+        For i = LBound(cpnDates) To UBound(cpnDates)
+            wcd = wcd + cpnPmt * CDbl(delivDate - cpnDates(i))
+        Next i
+    End If
+
+    WeightedCouponDays = wcd
+End Function
+
+
+
+Public Function DayCountName(dcc As Integer) As String
+    Select Case dcc
+        Case DCC_ACT_ACT_ICMA: DayCountName = "Act/Act ICMA"
+        Case DCC_ACT_ACT_ISDA: DayCountName = "Act/Act ISDA"
+        Case DCC_ACT_365F:     DayCountName = "Act/365 Fixed"
+        Case DCC_ACT_360:      DayCountName = "Act/360"
+        Case DCC_30_360_BOND:  DayCountName = "30/360 Bond (US SIA)"
+        Case DCC_30E_360:      DayCountName = "30E/360 Eurobond"
+        Case DCC_30E_360_ISDA: DayCountName = "30E/360 ISDA"
+        Case Else:             DayCountName = "Unknown (" & dcc & ")"
+    End Select
+End Function
+
+
+Public Function DayCountFraction(d1 As Date, d2 As Date, dcc As Integer, _
+                                  Optional freq As Integer = 2, _
+                                  Optional matDate As Variant) As Variant
+    Dim md As Date
+    Select Case dcc
+        Case DCC_ACT_ACT_ICMA
+            If IsMissing(matDate) Then
+                DayCountFraction = CVErr(xlErrValue): Exit Function
+            End If
+            md = CDate(matDate)
+            Dim prevC As Date: prevC = PrevCouponDate(d1, md, freq)
+            Dim nextC As Date: nextC = NextCouponDate(d1, md, freq)
+            DayCountFraction = CDbl(d2 - d1) / (CDbl(freq) * CDbl(nextC - prevC))
+        Case DCC_ACT_ACT_ISDA: DayCountFraction = ActActISDA_Fraction(d1, d2)
+        Case DCC_ACT_365F:     DayCountFraction = (d2 - d1) / 365#
+        Case DCC_ACT_360:      DayCountFraction = (d2 - d1) / 360#
+        Case DCC_30_360_BOND:  DayCountFraction = Days30_360_Bond(d1, d2) / 360#
+        Case DCC_30E_360:      DayCountFraction = Days30E_360(d1, d2) / 360#
+        Case DCC_30E_360_ISDA
+            If IsMissing(matDate) Then
+                DayCountFraction = CVErr(xlErrValue): Exit Function
+            End If
+            DayCountFraction = Days30E_360_ISDA(d1, d2, CDate(matDate)) / 360#
+        Case Else: DayCountFraction = CVErr(xlErrValue)
+    End Select
+End Function
+
+Public Function RepoYearFraction(d1 As Date, d2 As Date, repoDCC As Integer) As Double
+    Select Case repoDCC
+        Case DCC_ACT_360:      RepoYearFraction = (d2 - d1) / 360#
+        Case DCC_ACT_365F:     RepoYearFraction = (d2 - d1) / 365#
+        Case DCC_ACT_ACT_ISDA: RepoYearFraction = ActActISDA_Fraction(d1, d2)
+        Case Else:             RepoYearFraction = (d2 - d1) / 360#
+    End Select
+End Function
+
+Public Function AccruedFraction(settleDate As Date, prevCpn As Date, _
+                                 nextCpn As Date, freq As Integer, _
+                                 bondDcc As Integer, matDate As Date) As Double
+    Select Case bondDcc
+        Case DCC_ACT_ACT_ICMA
+            AccruedFraction = CDbl(settleDate - prevCpn) / CDbl(nextCpn - prevCpn)
+        Case DCC_ACT_ACT_ISDA
+            AccruedFraction = ActActISDA_Fraction(prevCpn, settleDate) * freq
+        Case DCC_ACT_365F
+            AccruedFraction = CDbl(settleDate - prevCpn) / (365# / freq)
+        Case DCC_ACT_360
+            AccruedFraction = CDbl(settleDate - prevCpn) / (360# / freq)
+        Case DCC_30_360_BOND
+            AccruedFraction = Days30_360_Bond(prevCpn, settleDate) / (360# / freq)
+        Case DCC_30E_360
+            AccruedFraction = Days30E_360(prevCpn, settleDate) / (360# / freq)
+        Case DCC_30E_360_ISDA
+            AccruedFraction = Days30E_360_ISDA(prevCpn, settleDate, matDate) / (360# / freq)
+        Case Else
+            AccruedFraction = CDbl(settleDate - prevCpn) / CDbl(nextCpn - prevCpn)
+    End Select
+End Function
+
+
+Public Function PrevCouponDate(refDate As Date, matDate As Date, _
+                                freq As Integer) As Date
+    Dim pMo As Integer, cpn As Date, m As Long
+    pMo = 12 \ freq
+    m = DateDiff("m", refDate, matDate)
+    cpn = DateAdd("m", -(Int(m / pMo) * pMo), matDate)
+    Do While cpn > refDate
+        cpn = DateAdd("m", -pMo, cpn)
+    Loop
+    Do While DateAdd("m", pMo, cpn) <= refDate
+        cpn = DateAdd("m", pMo, cpn)
+    Loop
+    PrevCouponDate = cpn
+End Function
+
+Public Function NextCouponDate(refDate As Date, matDate As Date, _
+                                freq As Integer) As Date
+    NextCouponDate = DateAdd("m", 12 \ freq, _
+                             PrevCouponDate(refDate, matDate, freq))
+End Function
+
+
+Public Function AccruedInterest(settleDate As Date, matDate As Date, _
+                                 couponRate As Double, freq As Integer, _
+                                 bondDcc As Integer) As Double
+    Dim prevCpn As Date, nextCpn As Date
+    prevCpn = PrevCouponDate(settleDate, matDate, freq)
+    nextCpn = NextCouponDate(settleDate, matDate, freq)
+    AccruedInterest = (couponRate / freq) * _
+                      AccruedFraction(settleDate, prevCpn, nextCpn, _
+                                      freq, bondDcc, matDate) * 100
+End Function
+
+Public Function DirtyPrice(cleanPrice As Double, settleDate As Date, _
+                             matDate As Date, couponRate As Double, _
+                             freq As Integer, bondDcc As Integer) As Double
+    DirtyPrice = cleanPrice + AccruedInterest(settleDate, matDate, _
+                                               couponRate, freq, bondDcc)
+End Function
+
+
+Public Function CouponDatesBetween(startDate As Date, endDate As Date, _
+                                    matDate As Date, freq As Integer) As Variant
+    Dim pMo As Integer, cpn As Date, tmp As Date
+    Dim buf() As Date, n As Integer, i As Integer
+    pMo = 12 \ freq
+    cpn = NextCouponDate(startDate, matDate, freq)
+    n = 0: tmp = cpn
+    Do While tmp < endDate
+        n = n + 1: tmp = DateAdd("m", pMo, tmp)
+    Loop
+    If n = 0 Then
+        CouponDatesBetween = Empty: Exit Function
+    End If
+    ReDim buf(1 To n): tmp = cpn
+    For i = 1 To n
+        buf(i) = tmp: tmp = DateAdd("m", pMo, tmp)
+    Next i
+    CouponDatesBetween = buf
+End Function
+
+Public Function SumCouponsBetween(settleDate As Date, delivDate As Date, _
+                                   matDate As Date, couponRate As Double, _
+                                   freq As Integer) As Double
+    Dim cpnDates As Variant
+    Dim cpnPmt   As Double
+    cpnDates = CouponDatesBetween(settleDate, delivDate, matDate, freq)
+    cpnPmt = (couponRate / freq) * 100
+    If IsEmpty(cpnDates) Then
+        SumCouponsBetween = 0
+    Else
+        SumCouponsBetween = (UBound(cpnDates) - LBound(cpnDates) + 1) * cpnPmt
+    End If
+End Function
+
+Public Function FVCouponsAtDelivery(settleDate As Date, delivDate As Date, _
+                                     matDate As Date, couponRate As Double, _
+                                     freq As Integer, repoRate As Double, _
+                                     repoDCC As Integer) As Double
+    Dim cpnDates As Variant
+    Dim i        As Integer
+    Dim cpnPmt   As Double
+    Dim fv       As Double
+    Dim b        As Double
+    cpnDates = CouponDatesBetween(settleDate, delivDate, matDate, freq)
+    cpnPmt = (couponRate / freq) * 100
+    b = RepoBasis(repoDCC)
+    fv = 0
+    If Not IsEmpty(cpnDates) Then
+        For i = LBound(cpnDates) To UBound(cpnDates)
+            fv = fv + cpnPmt * (1 + repoRate * (delivDate - cpnDates(i)) / b)
+        Next i
+    End If
+    FVCouponsAtDelivery = fv
+End Function
+
+Public Function InvoicePrice(futuresPrice As Double, convFactor As Double, _
+                              delivDate As Date, matDate As Date, _
+                              couponRate As Double, freq As Integer, _
+                              bondDcc As Integer) As Double
+    InvoicePrice = futuresPrice * convFactor + _
+                   AccruedInterest(delivDate, matDate, couponRate, freq, bondDcc)
+End Function
+
+
+Public Function GrossBasis(cleanPrice As Double, futuresPrice As Double, _
+                            convFactor As Double) As Double
+    GrossBasis = cleanPrice - futuresPrice * convFactor
+End Function
+
+Public Function CarryAmount(cleanPrice As Double, couponRate As Double, _
+                             freq As Integer, settleDate As Date, _
+                             delivDate As Date, matDate As Date, _
+                             repoRate As Double, bondDcc As Integer, _
+                             repoDCC As Integer) As Double
+    Dim AI0     As Double
+    Dim AI_D    As Double
+    Dim P0      As Double
+    Dim sumCpns As Double
+    Dim n       As Long
+    Dim b       As Double
+
+    AI0 = AccruedInterest(settleDate, matDate, couponRate, freq, bondDcc)
+    AI_D = AccruedInterest(delivDate, matDate, couponRate, freq, bondDcc)
+    P0 = cleanPrice + AI0
+    sumCpns = SumCouponsBetween(settleDate, delivDate, matDate, couponRate, freq)
+    n = delivDate - settleDate
+    b = RepoBasis(repoDCC)
+
+    CarryAmount = (AI_D - AI0 + sumCpns) - P0 * repoRate * (n / b)
+End Function
+
+
+Public Function NetBasis(cleanPrice As Double, futuresPrice As Double, _
+                          convFactor As Double, couponRate As Double, _
+                          freq As Integer, settleDate As Date, _
+                          delivDate As Date, matDate As Date, _
+                          repoRate As Double, bondDcc As Integer, _
+                          repoDCC As Integer) As Double
+    NetBasis = GrossBasis(cleanPrice, futuresPrice, convFactor) - _
+               CarryAmount(cleanPrice, couponRate, freq, settleDate, delivDate, _
+                           matDate, repoRate, bondDcc, repoDCC)
+End Function
+
+
+Public Function ForwardDirtyPrice(cleanPrice As Double, settleDate As Date, _
+                                   delivDate As Date, matDate As Date, _
+                                   couponRate As Double, freq As Integer, _
+                                   repoRate As Double, bondDcc As Integer, _
+                                   repoDCC As Integer) As Double
+    Dim P0   As Double
+    Dim n    As Long
+    Dim b    As Double
+    Dim fvCpns As Double
+
+    P0 = DirtyPrice(cleanPrice, settleDate, matDate, couponRate, freq, bondDcc)
+    n = delivDate - settleDate
+    b = RepoBasis(repoDCC)
+    fvCpns = FVCouponsAtDelivery(settleDate, delivDate, matDate, couponRate, _
+                                  freq, repoRate, repoDCC)
+
+    ForwardDirtyPrice = P0 * (1 + repoRate * n / b) - fvCpns
+End Function
+
+
+Public Function ForwardCleanPrice(cleanPrice As Double, settleDate As Date, _
+                                   delivDate As Date, matDate As Date, _
+                                   couponRate As Double, freq As Integer, _
+                                   repoRate As Double, bondDcc As Integer, _
+                                   repoDCC As Integer) As Double
+    Dim fwdDirty As Double
+    Dim AI_D     As Double
+
+    fwdDirty = ForwardDirtyPrice(cleanPrice, settleDate, delivDate, matDate, _
+                                  couponRate, freq, repoRate, bondDcc, repoDCC)
+    AI_D = AccruedInterest(delivDate, matDate, couponRate, freq, bondDcc)
+
+    ForwardCleanPrice = fwdDirty - AI_D
+End Function
+
+
+Public Function TheoreticalFuturesPrice(cleanPrice As Double, convFactor As Double, _
+                                         settleDate As Date, delivDate As Date, _
+                                         matDate As Date, couponRate As Double, _
+                                         freq As Integer, repoRate As Double, _
+                                         bondDcc As Integer, repoDCC As Integer) As Double
+    If convFactor = 0 Then
+        TheoreticalFuturesPrice = CVErr(xlErrDiv0): Exit Function
+    End If
+    TheoreticalFuturesPrice = ForwardCleanPrice(cleanPrice, settleDate, delivDate, _
+                                                 matDate, couponRate, freq, repoRate, _
+                                                 bondDcc, repoDCC) / convFactor
+End Function
+
+
+'===================================================================
+' SECTION 9 ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â BLOOMBERG IMPLIED REPO  (primary solver)
+'===================================================================
+
+' ImpliedRepoBloomberg: exact closed-form solution
+'
+' DERIVATION
+' Simple-interest no-arbitrage:
+'   P0 ÃƒÆ’Ã¢â‚¬â€ (1 + r ÃƒÆ’Ã¢â‚¬â€ n/B) = IP + ÃƒÅ½Ã‚Â£ cÃƒÂ¡Ã‚ÂµÃ‚Â¢ ÃƒÆ’Ã¢â‚¬â€ (1 + r ÃƒÆ’Ã¢â‚¬â€ (nÃƒÂ¢Ã‹â€ Ã¢â‚¬â„¢nÃƒÂ¡Ã‚ÂµÃ‚Â¢)/B)
+'
+' where nÃƒÂ¡Ã‚ÂµÃ‚Â¢ = delivDate ÃƒÂ¢Ã‹â€ Ã¢â‚¬â„¢ cpnDate_i  (reinvestment window for coupon i)
+'
+' Collect r terms (equation is LINEAR in r):
+'   r ÃƒÆ’Ã¢â‚¬â€ [P0 ÃƒÆ’Ã¢â‚¬â€ n/B ÃƒÂ¢Ã‹â€ Ã¢â‚¬â„¢ ÃƒÅ½Ã‚Â£ cÃƒÂ¡Ã‚ÂµÃ‚Â¢ ÃƒÆ’Ã¢â‚¬â€ (nÃƒÂ¢Ã‹â€ Ã¢â‚¬â„¢nÃƒÂ¡Ã‚ÂµÃ‚Â¢)/B] = IP + ÃƒÅ½Ã‚Â£cÃƒÂ¡Ã‚ÂµÃ‚Â¢ ÃƒÂ¢Ã‹â€ Ã¢â‚¬â„¢ P0
+'
+' Exact solution in one step:
+'   r = (IP + ÃƒÅ½Ã‚Â£cÃƒÂ¡Ã‚ÂµÃ‚Â¢ ÃƒÂ¢Ã‹â€ Ã¢â‚¬â„¢ P0) / (P0 ÃƒÆ’Ã¢â‚¬â€ n/B ÃƒÂ¢Ã‹â€ Ã¢â‚¬â„¢ ÃƒÅ½Ã‚Â£cÃƒÂ¡Ã‚ÂµÃ‚Â¢ ÃƒÆ’Ã¢â‚¬â€ (nÃƒÂ¢Ã‹â€ Ã¢â‚¬â„¢nÃƒÂ¡Ã‚ÂµÃ‚Â¢)/B)
+'     = (IP + ÃƒÅ½Ã‚Â£cÃƒÂ¡Ã‚ÂµÃ‚Â¢ ÃƒÂ¢Ã‹â€ Ã¢â‚¬â„¢ P0) / [(P0 ÃƒÆ’Ã¢â‚¬â€ n ÃƒÂ¢Ã‹â€ Ã¢â‚¬â„¢ WeightedCouponDays) / B]
+'
+' EQUIVALENCE TO ITERATIVE METHODS
+'   ImpliedRepoLinear and ImpliedRepoIterated (Section 11) converge
+'   to this same value. Bloomberg uses the closed form directly ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â
+'   no iteration required.
+'
+' Parameters
+'   cleanPrice    : market clean price per 100 face
+'   futuresPrice  : futures price per 100 face
+'   convFactor    : conversion factor (exchange-published, fixed)
+'   couponRate    : annual coupon rate, decimal
+'   freq          : coupon frequency
+'   settleDate    : bond settlement date (start of repo, tÃƒÂ¢Ã¢â‚¬Å¡Ã¢â€šÂ¬)
+'   delivDate     : futures delivery date (end of repo, D)
+'   matDate       : bond maturity date
+'   bondDCC       : bond accrual day-count convention  (DCC_* constant)
+'   repoDCC       : repo day-count convention          (DCC_* constant)
+'                   Bloomberg uses integer B (360 or 365) from RepoBasis()
+'
+' Returns CVErr(xlErrDiv0) if P0ÃƒÆ’Ã¢â‚¬â€n ÃƒÂ¢Ã‹â€ Ã¢â‚¬â„¢ WeightedCouponDays = 0
+Public Function ImpliedRepoBloomberg(cleanPrice As Double, futuresPrice As Double, _
+                                      convFactor As Double, couponRate As Double, _
+                                      freq As Integer, settleDate As Date, _
+                                      delivDate As Date, matDate As Date, _
+                                      bondDcc As Integer, repoDCC As Integer) As Double
+    Dim P0      As Double   ' dirty price at settlement
+    Dim IP      As Double   ' invoice price at delivery
+    Dim sumCpns As Double   ' ÃƒÅ½Ã‚Â£ cÃƒÂ¡Ã‚ÂµÃ‚Â¢  (face-value coupon cash, no reinvestment)
+    Dim wcd     As Double   ' ÃƒÅ½Ã‚Â£ cÃƒÂ¡Ã‚ÂµÃ‚Â¢ ÃƒÆ’Ã¢â‚¬â€ (delivDate ÃƒÂ¢Ã‹â€ Ã¢â‚¬â„¢ cpnDate_i)  [WeightedCouponDays]
+    Dim n       As Long     ' calendar days settle ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ delivery
+    Dim b       As Double   ' repo basis: 360 or 365
+    Dim num     As Double   ' numerator
+    Dim den     As Double   ' denominator
+
+    P0 = DirtyPrice(cleanPrice, settleDate, matDate, couponRate, freq, bondDcc)
+    IP = InvoicePrice(futuresPrice, convFactor, delivDate, matDate, couponRate, freq, bondDcc)
+    sumCpns = SumCouponsBetween(settleDate, delivDate, matDate, couponRate, freq)
+    wcd = WeightedCouponDays(settleDate, delivDate, matDate, couponRate, freq)
+    n = delivDate - settleDate
+    b = RepoBasis(repoDCC)
+
+    num = IP + sumCpns - P0
+    den = (P0 * n - wcd) / b
+
+    If den = 0 Then
+        ImpliedRepoBloomberg = CVErr(xlErrDiv0): Exit Function
+    End If
+
+    ImpliedRepoBloomberg = num / den
+End Function
+
+
+Public Sub ImpliedRepoSchedule(cleanPrice As Double, futuresPrice As Double, _
+                                convFactor As Double, couponRate As Double, _
+                                freq As Integer, settleDate As Date, _
+                                firstDelivDate As Date, lastDelivDate As Date, _
+                                matDate As Date, repoRate As Double, _
+                                bondDcc As Integer, repoDCC As Integer, _
+                                outputCell As Range)
+    Dim d       As Date
+    Dim rowIdx  As Long
+    Dim r       As Double
+    Dim AI_D    As Double
+    Dim sumCpns As Double
+    Dim wcd     As Double
+    Dim invPrc  As Double
+    Dim fwdClean As Double
+
+    Application.ScreenUpdating = False
+
+    With outputCell
+        .Offset(0, 0).value = "Delivery Date"
+        .Offset(0, 1).value = "n (days)"
+        .Offset(0, 2).value = "AI at Delivery [" & DayCountName(bondDcc) & "]"
+        .Offset(0, 3).value = "Sigma Coupons"
+        .Offset(0, 4).value = "Wtd Cpn Days"
+        .Offset(0, 5).value = "Invoice Price"
+        .Offset(0, 6).value = "Fwd Clean Price [" & DayCountName(repoDCC) & "]"
+        .Offset(0, 7).value = "Implied Repo [Bloomberg]"
+    End With
+
+    rowIdx = 1
+    d = firstDelivDate
+
+    Do While d <= lastDelivDate
+        If Weekday(d, vbMonday) <= 5 Then
+            AI_D = AccruedInterest(d, matDate, couponRate, freq, bondDcc)
+            sumCpns = SumCouponsBetween(settleDate, d, matDate, couponRate, freq)
+            wcd = WeightedCouponDays(settleDate, d, matDate, couponRate, freq)
+            invPrc = futuresPrice * convFactor + AI_D
+            fwdClean = ForwardCleanPrice(cleanPrice, settleDate, d, matDate, _
+                                          couponRate, freq, repoRate, bondDcc, repoDCC)
+            r = ImpliedRepoBloomberg(cleanPrice, futuresPrice, convFactor, _
+                                             couponRate, freq, settleDate, d, matDate, _
+                                             bondDcc, repoDCC)
+
+            With outputCell
+                .Offset(rowIdx, 0).value = d
+                .Offset(rowIdx, 0).numberFormat = "DD/MM/YYYY"
+                .Offset(rowIdx, 1).value = d - settleDate
+                .Offset(rowIdx, 2).value = AI_D
+                .Offset(rowIdx, 3).value = sumCpns
+                .Offset(rowIdx, 4).value = wcd
+                .Offset(rowIdx, 5).value = invPrc
+                .Offset(rowIdx, 6).value = fwdClean
+                .Offset(rowIdx, 7).value = r
+                .Offset(rowIdx, 7).numberFormat = "0.0000%"
+            End With
+
+            rowIdx = rowIdx + 1
+        End If
+        d = d + 1
+    Loop
+
+    Application.ScreenUpdating = True
+End Sub
+
+Public Function OptimalDeliveryDate(cleanPrice As Double, futuresPrice As Double, _
+                                     convFactor As Double, couponRate As Double, _
+                                     freq As Integer, settleDate As Date, _
+                                     firstDelivDate As Date, lastDelivDate As Date, _
+                                     matDate As Date, bondDcc As Integer, _
+                                     repoDCC As Integer) As Date
+    Dim d As Date, r As Double
+    Dim bestR As Double, bestD As Date
+    Dim first As Boolean: first = True
+
+    d = firstDelivDate
+    Do While d <= lastDelivDate
+        If Weekday(d, vbMonday) <= 5 Then
+            r = ImpliedRepoBloomberg(cleanPrice, futuresPrice, convFactor, _
+                                      couponRate, freq, settleDate, d, matDate, _
+                                      bondDcc, repoDCC)
+            If first Or r > bestR Then
+                bestR = r: bestD = d: first = False
+            End If
+        End If
+        d = d + 1
+    Loop
+
+    OptimalDeliveryDate = bestD
+End Function
+
+
+Public Function ImpliedRepoLinear(cleanPrice As Double, futuresPrice As Double, _
+                                   convFactor As Double, couponRate As Double, _
+                                   freq As Integer, settleDate As Date, _
+                                   delivDate As Date, matDate As Date, _
+                                   bondDcc As Integer, repoDCC As Integer) As Double
+    Dim P0  As Double, IP As Double
+    Dim ryf As Double, sumCpns As Double
+
+    P0 = DirtyPrice(cleanPrice, settleDate, matDate, couponRate, freq, bondDcc)
+    IP = InvoicePrice(futuresPrice, convFactor, delivDate, matDate, couponRate, freq, bondDcc)
+    sumCpns = SumCouponsBetween(settleDate, delivDate, matDate, couponRate, freq)
+    ryf = RepoYearFraction(settleDate, delivDate, repoDCC)
+
+    If P0 = 0 Or ryf = 0 Then
+        ImpliedRepoLinear = CVErr(xlErrDiv0): Exit Function
+    End If
+    ImpliedRepoLinear = (IP + sumCpns - P0) / (P0 * ryf)
+End Function
+
+
+Public Function ImpliedRepoIterated(cleanPrice As Double, futuresPrice As Double, _
+                                     convFactor As Double, couponRate As Double, _
+                                     freq As Integer, settleDate As Date, _
+                                     delivDate As Date, matDate As Date, _
+                                     bondDcc As Integer, repoDCC As Integer, _
+                                     Optional tol As Double = 0.0000000001, _
+                                     Optional maxIter As Integer = 50) As Double
+    Dim P0 As Double, IP As Double, ryf As Double
+    Dim r As Double, rNew As Double, iter As Integer
+
+    P0 = DirtyPrice(cleanPrice, settleDate, matDate, couponRate, freq, bondDcc)
+    IP = InvoicePrice(futuresPrice, convFactor, delivDate, matDate, couponRate, freq, bondDcc)
+    ryf = RepoYearFraction(settleDate, delivDate, repoDCC)
+
+    If P0 = 0 Or ryf = 0 Then
+        ImpliedRepoIterated = CVErr(xlErrDiv0): Exit Function
+    End If
+
+    r = ImpliedRepoLinear(cleanPrice, futuresPrice, convFactor, couponRate, _
+                          freq, settleDate, delivDate, matDate, bondDcc, repoDCC)
+
+    For iter = 1 To maxIter
+        rNew = (IP + FVCouponsAtDelivery(settleDate, delivDate, matDate, _
+                      couponRate, freq, r, repoDCC) - P0) / (P0 * ryf)
+        If Abs(rNew - r) < tol Then
+            ImpliedRepoIterated = rNew: Exit Function
+        End If
+        r = rNew
+    Next iter
+
+    ImpliedRepoIterated = rNew
+End Function
+
+
+
+
