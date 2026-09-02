@@ -1,0 +1,420 @@
+# The pipeline wiring.
+#
+# WHAT THIS FILE IS FOR
+#
+# Three things change at different rates and for different reasons:
+#
+#   wiring     paths, sheets, rows, columns, filters, which formula feeds which
+#              field, and what order the waves run in       -> THIS FILE
+#   maths      the 53 named builders                        -> Economic_formula_library.txt
+#   execution  where a wave actually runs                   -> the engine
+#
+# Keeping them apart is what lets the architecture move - Excel-computed today,
+# Access-computed tomorrow - without the formulas or the workflow moving with it.
+# A `formula:` below NAMES a builder; it never restates the maths. Rewiring is an
+# edit here; re-deriving is not possible from here, which is the point.
+#
+# Every value is quoted from source. docs/PIPELINE_SPEC.md carries the file:line
+# for each one and the reasoning behind it.
+
+version: 1
+
+# =============================================================================
+# DATES
+#
+# Two snapshots, both reproducible from Config. Nothing is frozen, so there is no
+# captured value to refresh and no un-freeze path to get wrong.
+# =============================================================================
+dates:
+  t_minus_1: {cell: 'Config!B4', meaning: opening snapshot, fetched_by: bql_point_in_time}
+  t0:        {cell: 'Config!B5', meaning: closing snapshot, fetched_by: bdp}
+
+# =============================================================================
+# SOURCES
+# =============================================================================
+sources:
+
+  bonds:
+    kind: sql
+    mechanism: power_query          # refreshed by lo.QueryTable.Refresh, not ADO
+    server: LOKI
+    database: OPICSMAIN
+    context: OpicsMain
+    lands_on: {sheet: Bonds, header_row: 3, first_row: 4, columns: 'A:K'}
+    guards:                         # hard-coded literals in LoadOPICS_Bonds, not constants
+      list_object_exists: true
+      header_row: 3
+      first_column: 1
+      column_count: 11
+    # SCOPE, not just filters.
+    #
+    # These four do not merely narrow the result - they DEFINE which slice of the
+    # book a run represents, and only one of them survives into a column
+    # (invtype -> Bonds!I AcctgCat, constant 'A' on every row). The others are
+    # invisible downstream.
+    #
+    # A run is therefore only comparable with another run over the SAME scope,
+    # which is why it is stamped onto Run and Run_Index rather than left implicit
+    # in a WHERE clause. Widening invtype to [A, T] would otherwise produce a run
+    # that looks identical to today's and means something else.
+    scope:
+      branch: '01'
+      portfolio: PORT
+      invtype: [A]
+      product: [OBR, SECUR]
+      surfaces_as: {invtype: 'Bonds!I', product: 'Bonds!J'}
+      record_on: [Run, Run_Index]
+    filters:
+      qty_not_zero: true
+    isin_type: ISIN
+    tables:
+      SPOS: {role: positions}
+      SECM: {role: security_master, join: 'SPOS.SECID = SECM.SECID', type: inner}
+      ASID: {role: alternative_ids, join: 'SPOS.SECID = ASID.SECID AND ASID.SECIDTYPE = ISIN', type: left}
+      TPOS: {role: book_values,     join: 'BR + COST + PORT + SECID + INVTYPE', type: left}
+    columns:
+      ISIN:         {from: ASID.SECALTID,   units: text}
+      Name:         {from: SECM.DESCR,      units: text}
+      Currency:     {from: SPOS.CCY,        units: text}
+      # Confirmed percent: many coupon rates are above 1, which a decimal rate
+      # cannot be. Every consumer divides by 100, so the code is correct.
+      Coupon_Dec:   {from: SECM.COUPRATE_8, units: percent}
+      CouponFreq:   {from: SECM.INTPAYCYCLE, units: text}
+      MaturityDate: {from: SECM.MDATE,      units: date}
+      Notional:     {from: SPOS.QTY,        units: nominal}
+      AvgCost:      {formula: avg_cost_ladder, units: price_per_100}
+      AcctgCat:     {from: SPOS.INVTYPE,    units: text, transform: trim}
+      # Confirmed: this is the PRODUCT classification (OBR / SECUR), not a
+      # portfolio. It lands in Bonds!J, whose VBA constant is misnamed
+      # BCOL_PORTFOLIO, and flows to PNL_Attribution!D 'Portfolio',
+      # Pos_Bond.Portfolio and a Dashboard column headed 'Portfolio'.
+      # There is no portfolio dimension in the data at all: the query filters
+      # sp.PORT = 'PORT', so the real portfolio is that constant for every row.
+      Product:      {from: SECM.PRODUCT,    units: text, lands_in: 'Bonds!J',
+                     mislabelled_as: Portfolio, is_aggregation_key: false}
+      BookVal_EUR:  {from: TPOS.TDBOOKVALUE, units: EUR, null_as: 0}
+    order_by: [CCY, INVTYPE, COST, MDATE]
+    # AvgCost, in order; the division is skipped when |QTY| = 0.
+    avg_cost_ladder:
+      - {when: '|QTY| > 0 and |TDBOOKVALUE| > 0',  value: '|TDBOOKVALUE| / |QTY| * 100'}
+      - {when: '|QTY| > 0 and |ADJTDBOOKVAL| > 0', value: '|ADJTDBOOKVAL| / |QTY| * 100'}
+      - {otherwise: SPOS.PURCHAVGCOST}
+
+  # ---------------------------------------------------------------------------
+  # The two coverage books. Same desk, same sheet name, DIFFERENT layouts - which
+  # is why they get one entry each rather than one entry with exceptions.
+  #
+  # Both are scanned in full: the blocks are not contiguous, so stopping at the
+  # first blank row silently drops everything below it.
+  # ---------------------------------------------------------------------------
+  hedges_rtj:
+    kind: excel
+    path: 'M:\P_Pires\TRADING\Hedge_Risco Tx Juro.xlsm'
+    sheet: Resumo
+    rows: [9, 220]
+    copy_columns: 'A:AI'
+    formula_of_a_into: AJ           # column A is often a link; its formula text is kept
+    scan: full
+    filter: {column: L, equals: 'HtC&S'}
+    carries: [swap, future]
+    tag: {Hedge_Source: RTJ}
+    columns:
+      rc:            {column: B}
+      isin:          {column: C, role: covered_bond}
+      bond_notional: {column: F, store_only: true}
+      type:          {column: H, role: row_type_discriminator}
+      counterparty:  {column: M}
+      info:          {column: D}
+      start_date:    {column: P}
+      end_date:      {column: Q}
+      ccy:           {column: T}
+    variants:
+      swap:
+        when: {type: 'Plain Vanilla Swap'}
+        emits: [PLAIN, SYNTHETIC]   # one source row can yield both
+        columns:
+          PLAIN:     {deal_id: I, fixed_leg: J, float_leg: K, notional: O}
+          SYNTHETIC: {deal_id: AC, fixed_leg: AD, float_leg: AE, notional: AF, end_date: AI}
+      future:
+        when: {type: 'not Plain Vanilla Swap'}
+        type_is_the_ticker: true    # RX1, OE1, UB1, UXY1, TU1, FY1, ...
+        columns: {contracts: O}
+
+  hedges_rt:
+    kind: excel
+    path: 'M:\P_Pires\TRADING\Hedge_Risco Total.xlsm'
+    sheet: Resumo
+    rows: [8, 34]
+    copy_columns: 'A:W'
+    formula_of_a_into: X
+    scan: full
+    filter: {column: M, equals: 'HtC&S'}
+    carries: [future]               # futures only - a swap-labelled row here is not a position
+    tag: {Hedge_Source: RT}
+    columns:
+      rc:            {column: A}
+      isin:          {column: B, role: covered_bond}
+      bond_notional: {column: E, store_only: true}
+      type:          {column: L, type_is_the_ticker: true}
+      counterparty:  {column: N}
+      contracts:     {column: P}    # NOT O - the two books genuinely differ here
+      start_date:    {column: Q}
+      ccy:           {column: R}
+      desk_bpv:      {column: S}
+
+  bloomberg:
+    kind: excel_worksheet_function  # BDP/BDH/BQL only - there is no API route
+    must_stay_in_excel: true
+    identity:
+      resolve_with: 'BDP(candidate, "PARSEKYABLE_DES")'
+      candidates: [isin, /isin/, ' Corp', '@BVAL Corp', '@BGN Corp',
+                   ' Govt', '@BVAL Govt', '@BGN Govt', ' Mtge', ' M-Mkt']
+      fallback: UNKNOWN
+      cache_in: Instrument          # the answer never changes; stop re-asking per run
+    fields:
+      bond:
+        CleanPx: {t0: PX_LAST,            t1: PX_LAST}
+        DirtyPx: {t0: PX_DIRTY_MID,       t1: "price(price_type='dirty')"}
+        YTM:     {t0: YLD_YTM_MID,        t1: "YIELD(YIELD_TYPE='YTM')"}
+        ZSprd:   {t0: Z_SPRD_MID,         t1: "SPREAD(SPREAD_TYPE='Z')"}
+        ASW:     {t0: ASSET_SWAP_SPD_MID, t1: "SPREAD(SPREAD_TYPE='ASW')"}
+        OAS:     {t0: OAS_SPREAD_MID,     t1: "SPREAD(SPREAD_TYPE='OAS')"}
+        ModDur:  {t0: DUR_ADJ_MID}
+        OASDur:  {t0: DUR_ADJ_OAS_MID}
+        OASCvx:  {t0: CONVEXITY_OAS}
+        PricingSource: {t0: PRICING_SOURCE}
+      future:
+        ticker_from: {lookup: FutMapTable, on: ContractCode, column: 2}
+        PointValue:  FUT_VAL_PT
+        UnitDV01:    FUT_PX_VAL_BP    # already includes the point value
+        DelivDate:   [LAST_TRADEABLE_DT, FUT_DLV_DT]
+        Price:       PX_LAST
+      swap:
+        NPV:      SW_MARKET_VAL
+        NPVPrior: SW_MARKET_VAL_PRIOR
+        NPVChg:   SW_MARKET_VAL_CHG
+        Notional: notional
+        DV01:     dv01              # DV01_BBG - what the attribution sums
+
+# =============================================================================
+# CURVES
+# =============================================================================
+curves:
+  sheet: OIS_Curves
+  header_row: 4
+  data_rows: [7, 19]
+  tenors_years: [0.0833, 0.25, 0.5, 1, 2, 3, 5, 7, 10, 15, 20, 30, 40]
+  blocks:
+    EUR: {years: B, ois: [C, D, E], gov: [F, G, H], swap: [I, J, K], g: [L, M], q: [N, O], status: P}
+    USD: {years: S, ois: [T, U, V], gov: [W, X, Y], swap: [Z, AA, AB], g: [AC, AD], q: [AE, AF], status: AG}
+    GBP: {years: AJ, ois: [AK, AL, AM], gov: [AN, AO, AP], swap: [AQ, AR, AS], g: [AT, AU], q: [AV, AW], status: AX}
+  spacers: [Q, R, AH, AI]
+  derived:
+    g: {formula: difference, args: {a: gov, b: ois},  meaning: govie basis}
+    q: {formula: difference, args: {a: swap, b: gov}, meaning: swap/gov basis}
+  interpolation: {formula: linear_on_years, outside_range: flat, on_failure: '#N/A -> blank'}
+  seeded_tickers:
+    EUR_OIS: [ESTRON Index, EESWEA Curncy, EESWEC Curncy, EESWEF Curncy,
+              EESWE1 Curncy, EESWE2 Curncy, EESWE3 Curncy, EESWE5 Curncy,
+              EESWE7 Curncy, EESWE10 Curncy, EESWE15 Curncy, EESWE20 Curncy,
+              EESWE30 Curncy]
+  known_defects:
+    - id: eur_ois_tenor_offset
+      detail: >-
+        13 tickers ON..30Y are paired by index against 13 tenors 1M..40Y, so
+        ESTRON lands on the 1M node and EESWE30 on the 40Y node. Every EUR OIS
+        node is one tenor out. Fix by prepending an overnight tenor or dropping 40.
+    - id: gov_t0_t1_field_mismatch
+      detail: >-
+        EUR and GBP Gov use YLD_YTM_MID for T0 and PX_LAST for T-1, so g_T0 and
+        g_T-1 are built from incommensurable quantities.
+
+# =============================================================================
+# THE HEDGE ROLL-UP
+#
+# What makes the bridge close per bond, and why a hedge with a blank LinkedISIN
+# is in no total at all.
+# =============================================================================
+rollup:
+  key: LinkedISIN
+  aggregates:
+    PlainSwap_DV01:     {from: Swaps,   column: DV01_BBG,         where: {Swap_ID_Source: PLAIN}}
+    SyntheticSwap_DV01: {from: Swaps,   column: DV01_BBG,         where: {Swap_ID_Source: SYNTHETIC}}
+    FuturesRTJ_DV01:    {from: Futures, column: Futures_DV01_EUR, where: {Hedge_Source: RTJ, Hedge_Class: RATES}}
+    FuturesRT_DV01:     {from: Futures, column: Futures_DV01_EUR, where: {Hedge_Source: RT,  Hedge_Class: RATES}}
+
+# =============================================================================
+# FIELDS
+#
+# `formula:` names a builder in Economic_formula_library.txt. `wave:` is the
+# topological rank tools/field_graph.py proves from the generated formula record.
+# Nothing in wave N reads wave N or later, so an engine can gate on it.
+#
+# This is the head of the list; the full 86 are generated into Meta_Column by
+# tools/gen_column_registry.py, which carries ProducedInWave and ConsumedBy.
+# =============================================================================
+fields:
+  - {name: Bond_DV01_Opening, wave: 0, formula: copy, args: {from: 'Bonds.DV01_Opening_EUR'}, units: EUR_per_bp}
+  - {name: Delta_r_bp,   wave: 0, formula: rate_change_bp, args: {t0: OIS_T0,  t1: OIS_T-1},  units: bp}
+  - {name: Delta_Gov_bp, wave: 0, formula: rate_change_bp, args: {t0: Gov_T0,  t1: Gov_T-1},  units: bp}
+  - {name: Delta_Swap_bp,wave: 0, formula: rate_change_bp, args: {t0: Swap_T0, t1: Swap_T-1}, units: bp}
+
+  - {name: Futures_DV01_EUR, wave: 0, formula: futures_dv01,
+     args: {contracts: Contracts, unit_dv01: HedgeUnitDV01, fx: FX_T0,
+            unit_dv01_includes_point_value: true}, units: EUR_per_bp}
+  - {name: FuturesPnL_EUR, wave: 0, formula: futures_pnl,
+     args: {contracts: Contracts, point_value: FUT_VAL_PT,
+            px_t0: FutPx_T0, px_t1: FutPx_T-1, fx: FX_T0}, units: EUR}
+
+  - {name: PnL_OIS,            wave: 1, formula: first_order, args: {dv01: Bond_DV01_Opening, delta_bp: Delta_r_bp},   units: EUR}
+  - {name: PnL_GovBasis,       wave: 1, formula: first_order, args: {dv01: Bond_DV01_Opening, delta_bp: Delta_g_bp},   units: EUR}
+  - {name: PnL_SwapGovBasis,   wave: 1, formula: first_order, args: {dv01: Bond_DV01_Opening, delta_bp: Delta_q_bp},   units: EUR}
+  - {name: PnL_Credit_Ispread, wave: 1, formula: first_order, args: {dv01: Bond_DV01_Opening, delta_bp: Delta_i_bp},   units: EUR}
+  - {name: PnL_ZSpread,        wave: 1, formula: first_order, args: {dv01: Bond_DV01_Opening, delta_bp: Delta_Z_bp},   units: EUR}
+  - {name: PnL_GSpread,        wave: 1, formula: first_order, args: {dv01: Bond_DV01_Opening, delta_bp: Delta_GSpread_bp}, units: EUR}
+  - {name: PnL_ASW,            wave: 1, formula: first_order, args: {dv01: Bond_DV01_Opening, delta_bp: Delta_ASW_bp}, units: EUR}
+  - {name: PnL_OAS,            wave: 1, formula: first_order, args: {dv01: Bond_DV01_Opening, delta_bp: Delta_OAS_bp}, units: EUR}
+
+  - {name: PnL_Convexity, wave: 1, formula: convexity_pnl,
+     args: {dirty_mv_t1: 'Bonds.DirtyMV_T-1_EUR', convexity: Convexity, delta_y_bp: Delta_Y_bp}, units: EUR}
+  # CouponCarryFml exists in the library and MUST NOT be wired in: it multiplies
+  # PositionSide by ABS(Notional), while the live cell uses the already-signed
+  # Notional directly. Applying the sign twice silently flips every short.
+  - {name: Carry_Coupon, wave: 2, formula: inline_live,
+     expression: 'Notional * (Coupon_Dec / 100) * YearFrac * FX_T-1',
+     do_not_wire: CouponCarryFml, units: EUR}
+  # FxPnLFml exists and MUST NOT be wired in: it blanks on missing inputs, while
+  # the live cell returns 0 - so a missing FX would blank Total_Model_Explained
+  # for the whole row instead of contributing nothing.
+  - {name: PnL_FX, wave: 0, formula: inline_live,
+     expression: 'IFERROR(IF(CCY="EUR", 0, (DirtyMV_T-1_EUR / FX_T-1) * (FX_T0 - FX_T-1)), 0)',
+     do_not_wire: FxPnLFml, units: EUR}
+  - {name: Risk_Timing_Bias, wave: 1, formula: first_order,
+     args: {dv01: 'Bond_DV01_Opening - Bond_DV01_Current', delta_bp: Delta_Y_bp}, units: EUR}
+
+# =============================================================================
+# FORMULA CATALOGUE STATUS
+#
+# Economic_formula_library.txt classifies its own builders, and the distinction
+# is load-bearing: six of them are an earlier, more permissive draft whose
+# economics deliberately DIFFER from the live sheet. Naming one of those in a
+# `formula:` above would change the model while looking like pure rewiring -
+# exactly the failure this file exists to prevent.
+#
+# tools/check_pipeline_config.py enforces this.
+# =============================================================================
+catalogue:
+  live:
+    [MarketValueChangeFml, ResidualPnLFml, ResidualPercentFml, HedgeEfficiencyFml,
+     Dv01ChangeFml, HedgeDv01GapFml, PullToParPriceFml, PriorSpreadFml,
+     RollToParFml, DiffFormula, XlBlank, XlText]
+  do_not_wire:
+    TotalCarryFml:       includes the funding leg; Carry_Total excludes it on purpose
+    TotalExplainedPnLFml: sums whatever is present; the live formula requires all six or blanks
+    CouponCarryFml:      re-applies PositionSide to an already-signed Notional
+    HedgeRatioFml:       unsigned; the live Hedge_Ratio is signed so a wrong-way hedge shows
+    FxPnLFml:            blanks on missing inputs; the live cell returns 0
+    FundingCarryFml:     re-applies PositionSide to an already-signed DirtyMV
+  aliases:
+    first_order:    FirstOrderPnLFml
+    futures_dv01:   FuturesDV01Fml
+    futures_pnl:    FuturesPnLFml
+    convexity_pnl:  ConvexityPnLFml
+    rate_change_bp: RateChangeBpFml
+    difference:     DiffFormula
+
+# =============================================================================
+# FRAMEWORK SELECTION
+# =============================================================================
+frameworks:
+  codes: [G, I, ASW, Z, OAS, OIS, SOFR, MIXED, REVIEW]
+  precedence: [per_bond_override, automatic, config_fallback, REVIEW]
+  override_table: SpreadOverrideTable
+  config_fallback_cell: 'Config!B18'
+  mixed_threshold: 0.2            # neither side below 20% of total hedge DV01
+  duration_chain:
+    G:    [PnL_OIS, PnL_GovBasis, PnL_GSpread]
+    I:    [PnL_OIS, PnL_GovBasis, PnL_SwapGovBasis, PnL_Credit_Ispread]
+    ASW:  [PnL_OIS, PnL_GovBasis, PnL_SwapGovBasis, PnL_ASW]
+    Z:    [PnL_OIS, PnL_GovBasis, PnL_SwapGovBasis, PnL_ZSpread]
+    OAS:  [PnL_OIS, PnL_GovBasis, PnL_SwapGovBasis, PnL_OAS]
+    OIS:  {formula: first_order, args: {dv01: Bond_DV01_Opening, delta_bp: Delta_Y_bp}}
+    SOFR: {formula: first_order, args: {dv01: Bond_DV01_Opening, delta_bp: Delta_Y_bp}}
+    MIXED: {blend: [G, I], weights: dv01_share}
+    REVIEW: null
+  spread_used:
+    G: PnL_GSpread
+    I: PnL_Credit_Ispread
+    ASW: PnL_ASW
+    Z: PnL_ZSpread
+    OAS: PnL_OAS
+    MIXED: {blend: [PnL_GSpread, PnL_Credit_Ispread], weights: dv01_share}
+    REVIEW: null
+
+# =============================================================================
+# THE IDENTITY
+# =============================================================================
+identity:
+  explained: [PnL_Duration_Total, PnL_Convexity, Carry_Total, PnL_FX,
+              Hedge_Curve_Model_PnL, Hedge_Model_Residual_PnL]
+  official:  [Delta_Dirty_MV_EUR, Coupon_Paid_EUR, Actual_Hedge_PnL]
+  residual:  'official - explained'
+  tie_out:   {name: Duration_Identity_Check,
+              expect: 'PnL_Duration_Total == -Bond_DV01_Opening * Delta_Y_bp'}
+
+# =============================================================================
+# EXECUTION
+#
+# The only section that changes when the architecture moves. Everything above is
+# the process; this is where each part of it runs today.
+# =============================================================================
+execution:
+  waves:
+    0: {engine: excel, gate: row_count_equals_bond_count}
+    1: {engine: excel, gate: owned_fields_non_null}
+    2: {engine: excel, gate: owned_fields_non_null}
+    3: {engine: excel, gate: owned_fields_non_null}
+    4: {engine: excel, gate: owned_fields_non_null}
+    5: {engine: excel, gate: owned_fields_non_null}
+    6: {engine: excel, gate: owned_fields_non_null}
+    7: {engine: excel, gate: owned_fields_non_null}
+    8: {engine: excel, gate: owned_fields_non_null}
+  on_gate_failure: {write_to: Run_Issue, then: stop}
+  recalculation: CalculateFullRebuild   # Calculate leaves the curve UDFs stale
+  store:
+    one_database_per_run: true
+    name: 'PNL_Run_{retrieved:%Y%m%d_%H%M%S}.accdb'
+    index: PNL_Runs_Index.accdb
+    # Stamped from sources.bonds.scope so a run says what it covers. Without
+    # these, two runs over different slices are indistinguishable in the store.
+    stamp_scope: [ScopeBranch, ScopePortfolio, ScopeAcctgCat, ScopeProducts]
+    # The real portfolio dimension is the PAIR - schema.sql's Portfolio table is
+    # already keyed (PortfolioCode, AcctgCat). Totals are comparable only within it.
+    comparable_within: [ScopePortfolio, ScopeAcctgCat]
+
+# =============================================================================
+# RESOLVED
+#
+# Both questions that gated this file are answered.
+# =============================================================================
+resolved:
+  - id: coupon_units
+    question: Is SECM.COUPRATE_8 a percentage or a decimal?
+    answer: percent
+    evidence: >-
+      Many coupon rates are above 1, which is not compatible with a decimal rate.
+      Every consumer already divides by 100, so no code change is needed.
+
+  - id: bonds_j_meaning
+    question: Is Bonds!J the portfolio or the product?
+    answer: product
+    consequence: >-
+      A naming defect, not a calculation one. Bonds!J is SECM.PRODUCT and carries
+      OBR / SECUR, but its constant is BCOL_PORTFOLIO and it is surfaced as
+      "Portfolio" on PNL_Attribution, in Pos_Bond and in the Dashboard's Top-N
+      tables. It is never an aggregation key - one reference in Dashboard.txt
+      (:2283), as a display column - so no total is wrong; the column heading is.
+      It also sits in AccBondPositionKey as the middle component, which is
+      harmless: the real portfolio is the constant 'PORT' for every row, so
+      Product is strictly more discriminating than the portfolio would have been.
+    fix: rename the label, do not re-point it - there is nothing else to point at

@@ -1,0 +1,17 @@
+# LibreOffice test-run leftovers
+/tmp/
+*.pyc
+__pycache__/
+
+# Run outputs.  Every one of these is reproducible from the inputs and the
+# config, so committing them would only ever create merge conflicts on
+# regenerated binaries.  The one that is NOT reproducible is the history file,
+# which accumulates one row per run - keep that somewhere durable if the snail
+# trail matters to you, but it does not belong in the repository either.
+/out/
+*.xlsx
+!docs/**/*.xlsx
+
+# Virtual environments
+.venv/
+venv/

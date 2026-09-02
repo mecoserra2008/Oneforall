@@ -1,0 +1,108 @@
+# =============================================================================
+# PnL Explainer - configuration
+#
+# This file replaces the Config sheet of the legacy workbook (cells B4..B50).
+# Unknown keys are a hard error: a typo that is silently ignored produces a run
+# that succeeds and reports the wrong number.
+#
+# Every economic choice below changes a figure on the report.  The reasoning for
+# each is in docs/MODEL.md.
+# =============================================================================
+
+run:
+  # REPORT convention, not the legacy VBA one:
+  #   prior  = T-1, the opening snapshot   (legacy Config!B4)
+  #   as_of  = T0,  the closing snapshot   (legacy Config!B5)
+  prior:  2025-09-29
+  as_of:  2025-09-30
+  base_ccy: EUR
+  label: daily
+  book: FIXED_INCOME
+
+paths:
+  # Relative paths are resolved against the repository root.
+  input_dir: data/sample
+  output_dir: out
+  bonds: positions_bonds.csv
+  futures: positions_futures.csv
+  swaps: positions_swaps.csv
+  curves: curves.csv
+  fx: fx.csv
+  spread_overrides: spread_overrides.csv
+  history: history/daily_pnl_history.csv
+
+model:
+  # Blank = resolve per bond from the hedge DV01 mix.  Set to one of
+  # G / I / ASW / Z / OAS / OIS / SOFR / MIXED / REVIEW to force the whole run.
+  spread_framework_override: ""
+
+  # Where the DV01 used for ATTRIBUTION is struck.
+  #   prior    risk as it stood at the START of the period being explained.
+  #            This is the attribution convention and the default.
+  #   current  risk after the move - what the legacy workbook did, and the
+  #            source of a standing residual of roughly 3% on a 50bp day.
+  # Either way, hedging metrics (ratio, efficiency, gap) always use CURRENT
+  # risk, because that is the risk the desk has to hedge tomorrow.
+  attribution_risk_date: prior
+
+  # exact   accrued(T0) - accrued(T-1) + coupons actually paid in the period.
+  #         Survives an ex-coupon date; the dirty-price drop is matched by the
+  #         coupon cash, so the bridge still closes.
+  # smooth  notional * coupon * yearfrac.  The legacy behaviour: simpler, but
+  #         it leaves a one-day residual the size of the coupon on pay dates.
+  coupon_carry: exact
+
+  # bump      central-difference reprice at convexity_bump_bp (legacy method)
+  # analytic  the same reprice at a vanishing bump - no finite-difference error
+  # supplied  take the Convexity column from the position file as given
+  convexity_source: bump
+  convexity_bump_bp: 100.0
+
+  # Practical PnL is a mark-to-market proxy with no financing leg, so funding
+  # is reported as an economic-carry memo OUTSIDE the bridge.  Turning this on
+  # requires the practical PnL feed to be funded too, or the residual opens by
+  # exactly the funding cost.
+  include_funding_in_bridge: false
+
+  # Book the second-order FX term (local move x FX move) explicitly instead of
+  # letting it fall into the unexplained residual.
+  fx_cross_term: true
+
+  pull_to_par:
+    enabled: true
+    day_basis: 365.0
+    max_cashflows: 1200
+
+futures:
+  # False  = FUT_PX_VAL_BP arrives in PRICE POINTS per bp, so cash DV01 needs a
+  #          further multiply by FUT_VAL_PT.  Desk check: DV01 / contracts
+  #          should read 60-90 for a Bund.
+  # True   = the feed is already cash per contract per bp.
+  dv01_includes_point_value: false
+  treat_missing_ctd_as_error: false
+
+swaps:
+  # supplied = the swap system's own BPV (legacy Bloomberg SW_CNV_BPV).
+  # annuity  = the internal single-annuity model.  A sanity check only: it
+  #            ignores the real payment schedule.
+  dv01_source: supplied
+  unknown_family_is_error: true
+
+tolerances:
+  hedge_ratio: 0.02
+  residual_pct: 0.10
+  residual_eur: 250.0
+  identity_pct: 0.01
+  identity_eur: 1.0
+
+output:
+  excel: pnl_explainer.xlsx
+  csv: daily_pnl_explained.csv
+  json: daily_pnl_metadata.json
+  bonds_csv: daily_pnl_bonds.csv
+  futures_csv: daily_pnl_futures.csv
+  swaps_csv: daily_pnl_swaps.csv
+  top_n: 15
+  append_history: true
+  date_stamp_filenames: false
+  float_format: "%.6f"

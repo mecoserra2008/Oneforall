@@ -1,0 +1,795 @@
+Option Explicit
+
+' =============================================================================
+' ECONOMIC FORMULA LIBRARY
+'
+' Every function here RETURNS AN EXCEL FORMULA STRING.  None of them writes to a
+' cell, and none of them reads one: they take ready-made cell references as text
+' ("$B5", or R1C1 like "RC55") and return the formula that computes a quantity
+' from them.  That is what makes an economic definition live in exactly one
+' place and stay usable from any sheet, in either reference style.
+'
+' This module is a real part of the project, not a snippet to paste into modPNL:
+' import it as its own module.  Pasting it in would collide with modPNL's own
+' definitions - which is what the old "paste this block inside modPNL" header
+' asked for, and why DiffFormula / XlBlank / XlText existed twice.  Those three
+' now live HERE and modPNL calls them across the module boundary.
+'
+' Calculation UDFs the returned formulas call, from modImpRepo:
+'   DayCountFraction, RepoYearFraction, AccruedInterest,
+'   SumCouponsBetween, GrossBasis, ImpliedRepoBloomberg
+'
+' Helper from modPNL:
+'   WrapIfPresent
+'
+' -----------------------------------------------------------------------------
+' STATUS: WHICH BUILDERS ARE LIVE
+'
+' Live - PNL_Attribution is written through these:
+'   MarketValueChangeFml, ResidualPnLFml, ResidualPercentFml,
+'   HedgeEfficiencyFml, Dv01ChangeFml, HedgeDv01GapFml,
+'   PullToParPriceFml, PriorSpreadFml, RollToParFml,
+'   DiffFormula, XlBlank, XlText
+' tests/test_formula_equivalence.bas pins their output character for character
+' against the strings WritePNLRow used to build inline.
+'
+' The rest are NOT wired in, and several of them MUST NOT be wired in without a
+' decision from the desk.  They are an earlier, more permissive draft of the
+' model, and where they differ from the live sheet the sheet is deliberate:
+'
+'   TotalCarryFml       includes the funding leg.  Carry_Total excludes it on
+'                       purpose: Official_Total_PnL is a mark-to-market proxy
+'                       with no financing leg, so adding funding to the
+'                       explained side opens a residual exactly equal to the
+'                       funding cost.  Funding is reported as a memo instead.
+'
+'   TotalExplainedPnLFml  SUMs whatever components happen to be present.  The
+'                       live formula requires ALL SIX, else blank - a partial
+'                       total that looks complete is worse than a blank.
+'
+'   CouponCarryFml      multiplies PositionSide by ABS(Notional).  The live
+'                       Carry_Coupon uses the already-signed Notional directly;
+'                       applying the sign twice silently flips every short.
+'
+'   HedgeRatioFml       ABS(hedge)/ABS(bond).  The live Hedge_Ratio is signed
+'                       (-hedge/bond) so a wrong-way hedge is visible rather
+'                       than reported as a good ratio.
+'
+'   FxPnLFml            blanks on missing inputs; the live PnL_FX returns 0, so
+'                       a missing FX does not blank the explained total.
+'
+'   FundingCarryFml     PositionSide * ABS(DirtyMV); the live Funding_Carry_Memo
+'                       uses the already-signed DirtyMV_T-1_EUR.
+'
+' Anything not listed above is simply unused - wiring it in is a normal change,
+' but check the guard conditions against the live cell first.
+' =============================================================================
+
+Public Function DiffFormula( _
+    ByVal aRef As String, _
+    ByVal bRef As String, _
+    Optional ByVal scaledBy100 As Boolean = False) As String
+
+    Dim body As String
+
+    If scaledBy100 Then
+        body = "(" & aRef & "-" & bRef & ")*100"
+    Else
+        body = aRef & "-" & bRef
+    End If
+
+    DiffFormula = _
+        "=IF(AND(ISNUMBER(" & aRef & ")," & _
+        "ISNUMBER(" & bRef & "))," & _
+        body & ","""")"
+
+End Function
+
+Public Function XlBlank() As String
+    XlBlank = Chr$(34) & Chr$(34)
+End Function
+
+Public Function XlText(ByVal s As String) As String
+    XlText = Chr$(34) & Replace(s, Chr$(34), Chr$(34) & Chr$(34)) & Chr$(34)
+End Function
+
+' Safely converts a rate stored either as decimal or percentage points to decimal.
+Public Function RateToDecimalFml(ByVal rateRef As String) As String
+    RateToDecimalFml = _
+        "IF(ISNUMBER(" & rateRef & "),IF(ABS(" & rateRef & ")>1," & _
+        rateRef & "/100," & rateRef & ")," & XlBlank() & ")"
+End Function
+
+' Calendar days remaining, floored at zero.
+Public Function DaysRemainingFml(ByVal maturityRef As String, _
+                                  ByVal asOfRef As String) As String
+    DaysRemainingFml = _
+        "=IF(AND(ISNUMBER(" & maturityRef & "),ISNUMBER(" & asOfRef & _
+        ")),MAX(0,INT(" & maturityRef & ")-INT(" & asOfRef & "))," & _
+        XlBlank() & ")"
+End Function
+
+' Calendar days to futures delivery, floored at zero.
+Public Function DaysToDeliveryFml(ByVal deliveryDateRef As String, _
+                                   ByVal asOfRef As String) As String
+    DaysToDeliveryFml = DaysRemainingFml(deliveryDateRef, asOfRef)
+End Function
+
+' Bond year fraction using the shared DayCountFraction UDF.
+Public Function YearFractionFml(ByVal startDateRef As String, _
+                                 ByVal endDateRef As String, _
+                                 ByVal dccRef As String, _
+                                 Optional ByVal frequencyRef As String = "2", _
+                                 Optional ByVal maturityRef As String = "") As String
+    Dim callExpr As String
+
+    If Len(maturityRef) > 0 Then
+        callExpr = "DayCountFraction(" & startDateRef & "," & endDateRef & _
+                   "," & dccRef & "," & frequencyRef & "," & maturityRef & ")"
+    Else
+        callExpr = "DayCountFraction(" & startDateRef & "," & endDateRef & _
+                   "," & dccRef & "," & frequencyRef & ")"
+    End If
+
+    YearFractionFml = _
+        "=IF(AND(ISNUMBER(" & startDateRef & "),ISNUMBER(" & endDateRef & _
+        "),ISNUMBER(" & dccRef & ")),IFERROR(" & callExpr & "," & _
+        XlBlank() & ")," & XlBlank() & ")"
+End Function
+
+' Reporting-period year fraction. Basis must be an Excel YEARFRAC basis code.
+Public Function ReportingYearFractionFml(ByVal startDateRef As String, _
+                                          ByVal endDateRef As String, _
+                                          Optional ByVal basisCode As Long = 1) As String
+    ReportingYearFractionFml = _
+        "=IF(AND(ISNUMBER(" & startDateRef & "),ISNUMBER(" & endDateRef & _
+        ")),IFERROR(YEARFRAC(" & startDateRef & "," & endDateRef & "," & _
+        CStr(basisCode) & ")," & XlBlank() & ")," & XlBlank() & ")"
+End Function
+
+' Repo year fraction using the shared RepoYearFraction UDF.
+Public Function RepoYearFractionFml(ByVal settlementDateRef As String, _
+                                     ByVal deliveryDateRef As String, _
+                                     ByVal repoDccRef As String) As String
+    RepoYearFractionFml = _
+        "=IF(AND(ISNUMBER(" & settlementDateRef & "),ISNUMBER(" & _
+        deliveryDateRef & "),ISNUMBER(" & repoDccRef & _
+        ")),IFERROR(RepoYearFraction(" & settlementDateRef & "," & _
+        deliveryDateRef & "," & repoDccRef & ")," & XlBlank() & _
+        ")," & XlBlank() & ")"
+End Function
+
+' Generalized curve interpolation builder.
+' curveType must be OIS, GOV or SWAP.
+Public Function CurveRateFml(ByVal curveType As String, _
+                              ByVal ccyRef As String, _
+                              ByVal yearsRef As String, _
+                              ByVal currentMarket As Boolean) As String
+    Dim udfName As String
+
+    Select Case UCase$(Trim$(curveType))
+        Case "OIS":  udfName = "InterpOIS"
+        Case "GOV":  udfName = "InterpGov"
+        Case "SWAP": udfName = "InterpSwap"
+        Case Else
+            CurveRateFml = "=" & XlBlank()
+            Exit Function
+    End Select
+
+    CurveRateFml = _
+        "=IF(OR(" & ccyRef & "=" & XlBlank() & ",NOT(ISNUMBER(" & _
+        yearsRef & ")))," & XlBlank() & ",IFERROR(" & udfName & "(" & _
+        ccyRef & "," & yearsRef & "," & IIf(currentMarket, "TRUE", "FALSE") & _
+        ")," & XlBlank() & "))"
+End Function
+
+' Change in a rate quoted in percentage points, returned in basis points.
+Public Function RateChangeBpFml(ByVal currentRateRef As String, _
+                                 ByVal priorRateRef As String) As String
+    RateChangeBpFml = DiffFormula(currentRateRef, priorRateRef, True)
+End Function
+
+' Government curve minus OIS curve, in the source rate unit.
+Public Function GovOisBasisFml(ByVal govRateRef As String, _
+                                ByVal oisRateRef As String) As String
+    GovOisBasisFml = DiffFormula(govRateRef, oisRateRef)
+End Function
+
+' Swap curve minus government curve, in the source rate unit.
+Public Function SwapGovBasisFml(ByVal swapRateRef As String, _
+                                 ByVal govRateRef As String) As String
+    SwapGovBasisFml = DiffFormula(swapRateRef, govRateRef)
+End Function
+
+' I-spread in basis points when yield and swap rate are percentage-point values.
+Public Function ISpreadFml(ByVal yieldRef As String, _
+                            ByVal swapRateRef As String) As String
+    ISpreadFml = DiffFormula(yieldRef, swapRateRef, True)
+End Function
+
+' G-spread in basis points when yield and government rate are percentage-point values.
+Public Function GSpreadFml(ByVal yieldRef As String, _
+                            ByVal govRateRef As String) As String
+    GSpreadFml = DiffFormula(yieldRef, govRateRef, True)
+End Function
+
+' Spread change. Set sourceInPercentPoints=True when the inputs are rates such as 3.25.
+Public Function SpreadChangeFml(ByVal currentSpreadRef As String, _
+                                 ByVal priorSpreadRef As String, _
+                                 Optional ByVal sourceInPercentPoints As Boolean = False) As String
+    SpreadChangeFml = DiffFormula(currentSpreadRef, priorSpreadRef, sourceInPercentPoints)
+End Function
+
+' Dirty market value in base currency.
+Public Function DirtyMarketValueFml(ByVal notionalRef As String, _
+                                     ByVal dirtyPriceRef As String, _
+                                     ByVal fxRef As String, _
+                                     Optional ByVal positionSideRef As String = "") As String
+    Dim body As String
+    Dim signExpr As String
+
+    signExpr = "1"
+    If Len(positionSideRef) > 0 Then signExpr = positionSideRef
+
+    body = signExpr & "*ABS(" & notionalRef & ")*" & dirtyPriceRef & "/100*" & fxRef
+
+    DirtyMarketValueFml = _
+        "=IF(AND(ISNUMBER(" & notionalRef & "),ISNUMBER(" & dirtyPriceRef & _
+        "),ISNUMBER(" & fxRef & ")" & _
+        IIf(Len(positionSideRef) > 0, ",ISNUMBER(" & positionSideRef & ")", "") & _
+        ")," & body & "," & XlBlank() & ")"
+End Function
+
+' Selects OAS duration when available, otherwise modified duration.
+Public Function SpreadDurationUsedFml(ByVal oasDurationRef As String, _
+                                       ByVal modDurationRef As String) As String
+    SpreadDurationUsedFml = _
+        "=IF(ISNUMBER(" & oasDurationRef & "),ABS(" & oasDurationRef & _
+        "),IF(ISNUMBER(" & modDurationRef & "),ABS(" & modDurationRef & _
+        ")," & XlBlank() & "))"
+End Function
+
+' Bond DV01 in base currency per one unit of nominal.
+Public Function BondUnitDV01Fml(ByVal durationRef As String, _
+                                 ByVal dirtyPriceRef As String, _
+                                 ByVal fxRef As String) As String
+    BondUnitDV01Fml = _
+        "=IF(AND(ISNUMBER(" & durationRef & "),ISNUMBER(" & dirtyPriceRef & _
+        "),ISNUMBER(" & fxRef & ")),ABS(" & durationRef & ")*ABS(" & _
+        dirtyPriceRef & ")/100*ABS(" & fxRef & ")*0.0001," & XlBlank() & ")"
+End Function
+
+' Signed bond-position DV01 in base currency.
+Public Function BondPositionDV01Fml(ByVal positionSideRef As String, _
+                                     ByVal notionalRef As String, _
+                                     ByVal unitDv01Ref As String) As String
+    BondPositionDV01Fml = _
+        "=IF(AND(ISNUMBER(" & positionSideRef & "),ISNUMBER(" & notionalRef & _
+        "),ISNUMBER(" & unitDv01Ref & "))," & positionSideRef & "*ABS(" & _
+        notionalRef & ")*" & unitDv01Ref & "," & XlBlank() & ")"
+End Function
+
+' Generic XLOOKUP from a bond ISIN to a requested Bonds column.
+Public Function BondLookupFml(ByVal isinRef As String, _
+                               ByVal bondIsinRange As String, _
+                               ByVal resultRange As String) As String
+    BondLookupFml = _
+        "=IF(" & isinRef & "=" & XlBlank() & "," & XlBlank() & _
+        ",IFERROR(XLOOKUP(" & isinRef & "," & bondIsinRange & "," & _
+        resultRange & "," & XlBlank() & ",0)," & XlBlank() & "))"
+End Function
+
+' Clean-price gross basis.
+Public Function FuturesGrossBasisFml(ByVal ctdCleanPriceRef As String, _
+                                      ByVal futuresPriceRef As String, _
+                                      ByVal conversionFactorRef As String) As String
+    FuturesGrossBasisFml = _
+        "=IF(AND(ISNUMBER(" & ctdCleanPriceRef & "),ISNUMBER(" & _
+        futuresPriceRef & "),ISNUMBER(" & conversionFactorRef & _
+        ")),GrossBasis(" & ctdCleanPriceRef & "," & futuresPriceRef & _
+        "," & conversionFactorRef & ")," & XlBlank() & ")"
+End Function
+
+' Signed futures market exposure in base currency.
+Public Function FuturesMarketValueFml(ByVal contractsRef As String, _
+                                       ByVal pointValueRef As String, _
+                                       ByVal futuresPriceRef As String, _
+                                       ByVal fxRef As String) As String
+    FuturesMarketValueFml = _
+        "=IF(AND(ISNUMBER(" & contractsRef & "),ISNUMBER(" & pointValueRef & _
+        "),ISNUMBER(" & futuresPriceRef & "),ISNUMBER(" & fxRef & _
+        "))," & contractsRef & "*" & pointValueRef & "*" & futuresPriceRef & _
+        "*" & fxRef & "," & XlBlank() & ")"
+End Function
+
+' Futures PnL in base currency.
+Public Function FuturesPnLFml(ByVal contractsRef As String, _
+                               ByVal pointValueRef As String, _
+                               ByVal currentPriceRef As String, _
+                               ByVal priorPriceRef As String, _
+                               ByVal fxRef As String) As String
+    FuturesPnLFml = _
+        "=IF(AND(ISNUMBER(" & contractsRef & "),ISNUMBER(" & pointValueRef & _
+        "),ISNUMBER(" & currentPriceRef & "),ISNUMBER(" & priorPriceRef & _
+        "),ISNUMBER(" & fxRef & "))," & contractsRef & "*" & pointValueRef & _
+        "*(" & currentPriceRef & "-" & priorPriceRef & ")*" & fxRef & _
+        "," & XlBlank() & ")"
+End Function
+
+' Futures DV01 in base currency.
+' unitDv01IncludesPointValue=True for Bloomberg FUT_PX_VAL_BP.
+Public Function FuturesDV01Fml(ByVal contractsRef As String, _
+                                ByVal unitDv01Ref As String, _
+                                ByVal fxRef As String, _
+                                Optional ByVal pointValueRef As String = "", _
+                                Optional ByVal unitDv01IncludesPointValue As Boolean = True) As String
+    Dim scaleExpr As String
+    Dim extraGuard As String
+
+    scaleExpr = "1"
+    extraGuard = ""
+
+    If Not unitDv01IncludesPointValue Then
+        If Len(pointValueRef) = 0 Then
+            FuturesDV01Fml = "=" & XlBlank()
+            Exit Function
+        End If
+        scaleExpr = pointValueRef
+        extraGuard = ",ISNUMBER(" & pointValueRef & ")"
+    End If
+
+    FuturesDV01Fml = _
+        "=IF(AND(ISNUMBER(" & contractsRef & "),ISNUMBER(" & unitDv01Ref & _
+        "),ISNUMBER(" & fxRef & ")" & extraGuard & ")," & contractsRef & _
+        "*" & unitDv01Ref & "*" & fxRef & "*" & scaleExpr & "," & _
+        XlBlank() & ")"
+End Function
+
+' Correctly ordered call to the shared ImpliedRepoBloomberg UDF.
+Public Function ImpliedRepoFml(ByVal cleanPriceRef As String, _
+                                ByVal futuresPriceRef As String, _
+                                ByVal conversionFactorRef As String, _
+                                ByVal couponRateRef As String, _
+                                ByVal frequencyRef As String, _
+                                ByVal settlementDateRef As String, _
+                                ByVal deliveryDateRef As String, _
+                                ByVal maturityDateRef As String, _
+                                ByVal bondDccRef As String, _
+                                ByVal repoDccRef As String) As String
+    Dim args As String
+    Dim guards As String
+
+    args = cleanPriceRef & "," & futuresPriceRef & "," & conversionFactorRef & _
+           "," & couponRateRef & "," & frequencyRef & "," & settlementDateRef & _
+           "," & deliveryDateRef & "," & maturityDateRef & "," & bondDccRef & _
+           "," & repoDccRef
+
+    guards = "ISNUMBER(" & cleanPriceRef & "),ISNUMBER(" & futuresPriceRef & _
+             "),ISNUMBER(" & conversionFactorRef & ")," & conversionFactorRef & _
+             "<>0,ISNUMBER(" & couponRateRef & "),ISNUMBER(" & frequencyRef & _
+             ")," & frequencyRef & ">0,ISNUMBER(" & settlementDateRef & _
+             "),ISNUMBER(" & deliveryDateRef & ")," & deliveryDateRef & ">" & _
+             settlementDateRef & ",ISNUMBER(" & maturityDateRef & _
+             "),ISNUMBER(" & bondDccRef & "),ISNUMBER(" & repoDccRef & ")"
+
+    ImpliedRepoFml = _
+        "=IF(AND(" & guards & "),IFERROR(ImpliedRepoBloomberg(" & args & _
+        ")," & XlBlank() & ")," & XlBlank() & ")"
+End Function
+
+' Selects the floating reference curve used by a swap.
+Public Function SwapFloatingCurveFml(ByVal ccyRef As String, _
+                                      ByVal familyRef As String, _
+                                      ByVal oisRateRef As String, _
+                                      ByVal yearsRef As String, _
+                                      ByVal currentMarket As Boolean) As String
+    SwapFloatingCurveFml = _
+        "=IF(OR(" & ccyRef & "=" & XlBlank() & "," & familyRef & "=" & _
+        XlBlank() & ")," & XlBlank() & ",IF(UPPER(TRIM(" & ccyRef & _
+        "))<>" & XlText("EUR") & "," & oisRateRef & ",IF(UPPER(TRIM(" & _
+        familyRef & "))=" & XlText("ESTR") & "," & oisRateRef & _
+        ",IF(UPPER(TRIM(" & familyRef & "))=" & XlText("EURIBOR") & _
+        ",IFERROR(InterpSwap(" & ccyRef & "," & yearsRef & "," & _
+        IIf(currentMarket, "TRUE", "FALSE") & ")," & XlBlank() & ")," & _
+        XlBlank() & "))))"
+End Function
+
+' Fixed rate plus contractual floating spread minus selected floating curve.
+Public Function SwapModelSpreadFml(ByVal fixedRateRef As String, _
+                                    ByVal floatSpreadRef As String, _
+                                    ByVal floatCurveRef As String) As String
+    SwapModelSpreadFml = _
+        "=IF(AND(ISNUMBER(" & fixedRateRef & "),ISNUMBER(" & floatSpreadRef & _
+        "),ISNUMBER(" & floatCurveRef & "))," & fixedRateRef & "+" & _
+        floatSpreadRef & "-" & floatCurveRef & "," & XlBlank() & ")"
+End Function
+
+' Direct swap NPV when available, otherwise the sum of available leg NPVs.
+Public Function SwapTotalNpvFml(ByVal directNpvRef As String, _
+                                 ByVal fixedLegNpvRef As String, _
+                                 ByVal floatingLegNpvRef As String) As String
+    SwapTotalNpvFml = _
+        "=IF(ISNUMBER(" & directNpvRef & ")," & directNpvRef & _
+        ",IF(OR(ISNUMBER(" & fixedLegNpvRef & "),ISNUMBER(" & _
+        floatingLegNpvRef & ")),SUM(" & fixedLegNpvRef & "," & _
+        floatingLegNpvRef & ")," & XlBlank() & "))"
+End Function
+
+' Change in market value.
+Public Function MarketValueChangeFml(ByVal currentMvRef As String, _
+                                      ByVal priorMvRef As String) As String
+    MarketValueChangeFml = DiffFormula(currentMvRef, priorMvRef)
+End Function
+
+' Generic first-order PnL: minus DV01 times a move in basis points.
+Public Function FirstOrderPnLFml(ByVal dv01Ref As String, _
+                                  ByVal changeBpRef As String, _
+                                  Optional ByVal returnZeroIfMissing As Boolean = False) As String
+    Dim missingExpr As String
+
+    missingExpr = XlBlank()
+    If returnZeroIfMissing Then missingExpr = "0"
+
+    FirstOrderPnLFml = _
+        "=IF(AND(ISNUMBER(" & dv01Ref & "),ISNUMBER(" & changeBpRef & _
+        ")),-" & dv01Ref & "*" & changeBpRef & "," & missingExpr & ")"
+End Function
+
+' Second-order convexity PnL.
+Public Function ConvexityPnLFml(ByVal positionSideRef As String, _
+                                 ByVal marketValueRef As String, _
+                                 ByVal convexityRef As String, _
+                                 ByVal yieldChangeBpRef As String) As String
+    ConvexityPnLFml = _
+        "=IF(AND(ISNUMBER(" & positionSideRef & "),ISNUMBER(" & _
+        marketValueRef & "),ISNUMBER(" & convexityRef & "),ISNUMBER(" & _
+        yieldChangeBpRef & ")),0.5*" & positionSideRef & "*ABS(" & _
+        marketValueRef & ")*" & convexityRef & "*(" & yieldChangeBpRef & _
+        "/10000)^2," & XlBlank() & ")"
+End Function
+
+' Smooth coupon-accrual approximation.
+Public Function CouponCarryFml(ByVal positionSideRef As String, _
+                                ByVal notionalRef As String, _
+                                ByVal couponRateRef As String, _
+                                ByVal yearFractionRef As String, _
+                                ByVal fxRef As String) As String
+    CouponCarryFml = _
+        "=IF(AND(ISNUMBER(" & positionSideRef & "),ISNUMBER(" & notionalRef & _
+        "),ISNUMBER(" & couponRateRef & "),ISNUMBER(" & yearFractionRef & _
+        "),ISNUMBER(" & fxRef & "))," & positionSideRef & "*ABS(" & _
+        notionalRef & ")*" & RateToDecimalFml(couponRateRef) & "*" & _
+        yearFractionRef & "*" & fxRef & "," & XlBlank() & ")"
+End Function
+
+' Exact coupon carry using accrued interest and coupon dates from the shared UDFs.
+Public Function CouponCarryExactFml(ByVal startDateRef As String, _
+                                     ByVal endDateRef As String, _
+                                     ByVal maturityRef As String, _
+                                     ByVal couponRateRef As String, _
+                                     ByVal frequencyRef As String, _
+                                     ByVal bondDccRef As String, _
+                                     ByVal notionalRef As String, _
+                                     ByVal positionSideRef As String, _
+                                     ByVal fxRef As String) As String
+    Dim aiStart As String
+    Dim aiEnd As String
+    Dim coupons As String
+
+    aiStart = "AccruedInterest(" & startDateRef & "," & maturityRef & "," & _
+              RateToDecimalFml(couponRateRef) & "," & frequencyRef & "," & _
+              bondDccRef & ")"
+    aiEnd = "AccruedInterest(" & endDateRef & "," & maturityRef & "," & _
+            RateToDecimalFml(couponRateRef) & "," & frequencyRef & "," & _
+            bondDccRef & ")"
+    coupons = "SumCouponsBetween(" & startDateRef & "," & endDateRef & _
+              "," & maturityRef & "," & RateToDecimalFml(couponRateRef) & _
+              "," & frequencyRef & ")"
+
+    CouponCarryExactFml = _
+        "=IF(AND(ISNUMBER(" & startDateRef & "),ISNUMBER(" & endDateRef & _
+        "),ISNUMBER(" & maturityRef & "),ISNUMBER(" & couponRateRef & _
+        "),ISNUMBER(" & frequencyRef & "),ISNUMBER(" & bondDccRef & _
+        "),ISNUMBER(" & notionalRef & "),ISNUMBER(" & positionSideRef & _
+        "),ISNUMBER(" & fxRef & ")),IFERROR(" & positionSideRef & "*ABS(" & _
+        notionalRef & ")/100*(" & aiEnd & "-" & aiStart & "+" & coupons & _
+        ")*" & fxRef & "," & XlBlank() & ")," & XlBlank() & ")"
+End Function
+
+' Linear roll-to-par approximation based on prior clean price.
+' Pull to par (the desk calls it roll-to-par): the part of a bond's CLEAN price
+' change that is pure passage of time, with the curve and the spread held at
+' their prior levels.
+'
+' Delegates to the BondPullToParPrice UDF, which prices the bond forward on the
+' prior curve - see the PULL TO PAR block in modPNL for the method and why it is
+' not a spot reprice at a shorter maturity.
+'
+' This builder USED to emit a straight-line approximation:
+'
+'     side * |notional| * fx * ((100 - cleanPrice)/100)
+'                            * (daysElapsed / daysToMaturity)
+'
+' which amortises the premium or discount evenly to maturity.  That ignores the
+' curve completely: it gives the same answer for a bond trading at 104 whether
+' the curve is flat, steep or inverted, and it cannot see roll-down at all.  It
+' is kept nowhere - a superseded formula sitting in a library called "economic
+' formula library" is an invitation to wire it back in.
+'
+' Returns a price change per 100 nominal.  The caller applies notional and FX,
+' exactly as PNL_Attribution!Carry_RollToPar does.
+Public Function PullToParPriceFml(ByVal priorDateRef As String, _
+                                   ByVal currentDateRef As String, _
+                                   ByVal maturityRef As String, _
+                                   ByVal couponRateRef As String, _
+                                   ByVal frequencyRef As String, _
+                                   ByVal bondDccRef As String, _
+                                   ByVal currencyRef As String, _
+                                   ByVal frameworkRef As String, _
+                                   ByVal priorSpreadRef As String) As String
+
+    PullToParPriceFml = _
+        "BondPullToParPrice(" & _
+            priorDateRef & "," & _
+            currentDateRef & "," & _
+            maturityRef & "," & _
+            couponRateRef & "," & _
+            frequencyRef & "," & _
+            bondDccRef & "," & _
+            currencyRef & "," & _
+            frameworkRef & "," & _
+            priorSpreadRef & _
+        ")"
+
+End Function
+
+
+' The prior-date spread the pull-to-par calculation is calibrated on, chosen by
+' the bond's spread framework.  Wraps the BondSpreadTMinus1 UDF.
+Public Function PriorSpreadFml(ByVal frameworkRef As String, _
+                                ByVal gSpreadRef As String, _
+                                ByVal iSpreadRef As String, _
+                                ByVal aswRef As String, _
+                                ByVal zSpreadRef As String, _
+                                ByVal oasRef As String) As String
+
+    PriorSpreadFml = _
+        "BondSpreadTMinus1(" & _
+            frameworkRef & "," & _
+            gSpreadRef & "," & _
+            iSpreadRef & "," & _
+            aswRef & "," & _
+            zSpreadRef & "," & _
+            oasRef & _
+        ")"
+
+End Function
+
+
+' Carry_RollToPar as it lands on PNL_Attribution: the clean price change above,
+' scaled by the position and translated at the PRIOR fix.
+'
+' FX convention: carry accrues on the position as held at the START of the
+' period, so this and the coupon leg both translate at FX_T-1.  Using FX_T0 for
+' one and FX_T-1 for the other mixes an FX effect into carry that PnL_FX already
+' accounts for separately.
+Public Function RollToParFml(ByVal notionalRef As String, _
+                              ByVal priorFxRef As String, _
+                              ByVal pullToParPriceExpr As String) As String
+
+    RollToParFml = _
+        "=IFERROR(" & notionalRef & "*" & priorFxRef & "*" & _
+        pullToParPriceExpr & "/100," & XlBlank() & ")"
+
+End Function
+
+' Funding carry using the average valid funding rate.
+Public Function FundingCarryFml(ByVal positionSideRef As String, _
+                                 ByVal priorDirtyMarketValueRef As String, _
+                                 ByVal currentFundingRateRef As String, _
+                                 ByVal priorFundingRateRef As String, _
+                                 ByVal yearFractionRef As String) As String
+    Dim selectedRate As String
+
+    selectedRate = _
+        "IF(AND(ISNUMBER(" & currentFundingRateRef & "),ISNUMBER(" & _
+        priorFundingRateRef & ")),AVERAGE(" & currentFundingRateRef & "," & _
+        priorFundingRateRef & "),IF(ISNUMBER(" & priorFundingRateRef & ")," & _
+        priorFundingRateRef & "," & currentFundingRateRef & "))"
+
+    FundingCarryFml = _
+        "=IF(AND(ISNUMBER(" & positionSideRef & "),ISNUMBER(" & _
+        priorDirtyMarketValueRef & "),ISNUMBER(" & yearFractionRef & _
+        "),OR(ISNUMBER(" & currentFundingRateRef & "),ISNUMBER(" & _
+        priorFundingRateRef & "))),-" & positionSideRef & "*ABS(" & _
+        priorDirtyMarketValueRef & ")*" & RateToDecimalFml(selectedRate) & _
+        "*" & yearFractionRef & "," & XlBlank() & ")"
+End Function
+
+' Total carry from coupon, roll-to-par and funding components.
+Public Function TotalCarryFml(ByVal couponCarryRef As String, _
+                               ByVal rollToParRef As String, _
+                               ByVal fundingCarryRef As String) As String
+    TotalCarryFml = _
+        "=IF(COUNT(" & couponCarryRef & "," & rollToParRef & "," & _
+        fundingCarryRef & ")=0," & XlBlank() & ",SUM(" & couponCarryRef & _
+        "," & rollToParRef & "," & fundingCarryRef & "))"
+End Function
+
+' FX translation PnL for a non-base-currency position.
+Public Function FxPnLFml(ByVal currencyRef As String, _
+                          ByVal priorMarketValueBaseRef As String, _
+                          ByVal currentFxRef As String, _
+                          ByVal priorFxRef As String, _
+                          Optional ByVal baseCurrency As String = "EUR") As String
+    FxPnLFml = _
+        "=IF(UPPER(TRIM(" & currencyRef & "))=" & XlText(UCase$(baseCurrency)) & _
+        ",0,IF(AND(ISNUMBER(" & priorMarketValueBaseRef & "),ISNUMBER(" & _
+        currentFxRef & "),ISNUMBER(" & priorFxRef & ")," & priorFxRef & _
+        "<>0),(" & priorMarketValueBaseRef & "/" & priorFxRef & ")*(" & _
+        currentFxRef & "-" & priorFxRef & ")," & XlBlank() & "))"
+End Function
+
+' Selects the credit-spread framework.
+' callableRef is expected to be TRUE/FALSE or 1/0.
+' unknownSwapFamilyRef is expected to be TRUE/FALSE or 1/0.
+Public Function SpreadFrameworkFml(ByVal futuresDv01Ref As String, _
+                                    ByVal euriborSwapDv01Ref As String, _
+                                    ByVal estrSwapDv01Ref As String, _
+                                    ByVal hasIRef As String, _
+                                    ByVal hasGRef As String, _
+                                    ByVal hasOisSpreadRef As String, _
+                                    ByVal hasOasRef As String, _
+                                    ByVal callableRef As String, _
+                                    ByVal unknownSwapFamilyRef As String) As String
+    SpreadFrameworkFml = _
+        "=LET(_f,ABS(N(" & futuresDv01Ref & ")),_e,ABS(N(" & _
+        euriborSwapDv01Ref & ")),_o,ABS(N(" & estrSwapDv01Ref & _
+        ")),_tot,_f+_e+_o,IF(" & unknownSwapFamilyRef & "," & _
+        XlText("REVIEW") & ",IF(AND(" & callableRef & "," & hasOasRef & _
+        ")," & XlText("OAS") & ",IF(_tot=0,IF(" & hasIRef & "," & _
+        XlText("I") & ",IF(" & hasGRef & "," & XlText("G") & _
+        ",IF(" & hasOisSpreadRef & "," & XlText("OIS") & "," & _
+        XlText("MISSING") & "))),IF(AND(_f>0,_e=0,_o=0),IF(" & hasGRef & _
+        "," & XlText("G") & "," & XlText("MISSING") & _
+        "),IF(AND(_e>0,_f=0,_o=0),IF(" & hasIRef & "," & XlText("I") & _
+        "," & XlText("MISSING") & "),IF(AND(_o>0,_f=0,_e=0),IF(" & _
+        hasOisSpreadRef & "," & XlText("OIS") & "," & _
+        XlText("MISSING") & ")," & XlText("MIXED") & ")))))))"
+End Function
+
+' Selects or DV01-weights the spread PnL used by the attribution.
+Public Function SelectedSpreadPnLFml(ByVal frameworkRef As String, _
+                                      ByVal futuresDv01Ref As String, _
+                                      ByVal euriborSwapDv01Ref As String, _
+                                      ByVal estrSwapDv01Ref As String, _
+                                      ByVal iSpreadPnlRef As String, _
+                                      ByVal gSpreadPnlRef As String, _
+                                      ByVal oisSpreadPnlRef As String, _
+                                      ByVal oasPnlRef As String) As String
+    SelectedSpreadPnLFml = _
+        "=LET(_f,ABS(N(" & futuresDv01Ref & ")),_e,ABS(N(" & _
+        euriborSwapDv01Ref & ")),_o,ABS(N(" & estrSwapDv01Ref & _
+        ")),_tot,_f+_e+_o,SWITCH(" & frameworkRef & "," & XlText("G") & _
+        "," & gSpreadPnlRef & "," & XlText("I") & "," & iSpreadPnlRef & _
+        "," & XlText("OIS") & "," & oisSpreadPnlRef & "," & _
+        XlText("OAS") & "," & oasPnlRef & "," & XlText("MIXED") & _
+        ",IF(_tot=0," & XlBlank() & ",IF(AND(ISNUMBER(" & gSpreadPnlRef & _
+        "),ISNUMBER(" & iSpreadPnlRef & "),ISNUMBER(" & oisSpreadPnlRef & _
+        ")),(_f*" & gSpreadPnlRef & "+_e*" & iSpreadPnlRef & "+_o*" & _
+        oisSpreadPnlRef & ")/_tot," & XlBlank() & "))," & XlBlank() & "))"
+End Function
+
+' Total first-order duration attribution using the selected spread PnL.
+Public Function DurationAttributionTotalFml(ByVal oisPnlRef As String, _
+                                             ByVal govBasisPnlRef As String, _
+                                             ByVal swapGovBasisPnlRef As String, _
+                                             ByVal selectedSpreadPnlRef As String) As String
+    DurationAttributionTotalFml = _
+        "=IF(COUNT(" & oisPnlRef & "," & govBasisPnlRef & "," & _
+        swapGovBasisPnlRef & "," & selectedSpreadPnlRef & ")=0," & _
+        XlBlank() & ",SUM(" & oisPnlRef & "," & govBasisPnlRef & "," & _
+        swapGovBasisPnlRef & "," & selectedSpreadPnlRef & "))"
+End Function
+
+' Generic linked-hedge aggregation using SUMIFS.
+Public Function LinkedHedgeSumFml(ByVal valueRange As String, _
+                                   ByVal isinRange As String, _
+                                   ByVal isinRef As String, _
+                                   Optional ByVal typeRange As String = "", _
+                                   Optional ByVal typeValue As String = "") As String
+    Dim fml As String
+
+    fml = "=IFERROR(SUMIFS(" & valueRange & "," & isinRange & "," & isinRef
+
+    If Len(typeRange) > 0 And Len(typeValue) > 0 Then
+        fml = fml & "," & typeRange & "," & XlText(typeValue)
+    End If
+
+    LinkedHedgeSumFml = fml & "),0)"
+End Function
+
+' Absolute hedge ratio.
+Public Function HedgeRatioFml(ByVal hedgeDv01Ref As String, _
+                               ByVal bondDv01Ref As String) As String
+    HedgeRatioFml = _
+        "=IF(AND(ISNUMBER(" & hedgeDv01Ref & "),ISNUMBER(" & bondDv01Ref & _
+        ")," & bondDv01Ref & "<>0),ABS(" & hedgeDv01Ref & ")/ABS(" & _
+        bondDv01Ref & ")," & XlBlank() & ")"
+End Function
+
+' Hedge efficiency as one minus the absolute PnL mismatch ratio.
+Public Function HedgeEfficiencyFml(ByVal actualHedgePnlRef As String, _
+                                    ByVal theoreticalHedgePnlRef As String) As String
+    HedgeEfficiencyFml = _
+        "=IF(AND(ISNUMBER(" & actualHedgePnlRef & "),ISNUMBER(" & _
+        theoreticalHedgePnlRef & ")," & theoreticalHedgePnlRef & _
+        "<>0),1-ABS(" & actualHedgePnlRef & "-" & theoreticalHedgePnlRef & _
+        ")/ABS(" & theoreticalHedgePnlRef & ")," & XlBlank() & ")"
+End Function
+
+' Current DV01 minus initial DV01.
+Public Function Dv01ChangeFml(ByVal currentDv01Ref As String, _
+                               ByVal initialDv01Ref As String) As String
+    Dv01ChangeFml = DiffFormula(currentDv01Ref, initialDv01Ref)
+End Function
+
+' Actual hedge DV01 minus target hedge DV01.
+Public Function HedgeDv01GapFml(ByVal actualHedgeDv01Ref As String, _
+                                 ByVal targetHedgeDv01Ref As String) As String
+    HedgeDv01GapFml = DiffFormula(actualHedgeDv01Ref, targetHedgeDv01Ref)
+End Function
+
+' Absolute DV01 gap divided by absolute target DV01.
+Public Function HedgeInefficiencyFml(ByVal hedgeDv01GapRef As String, _
+                                      ByVal targetHedgeDv01Ref As String) As String
+    HedgeInefficiencyFml = _
+        "=IF(AND(ISNUMBER(" & hedgeDv01GapRef & "),ISNUMBER(" & _
+        targetHedgeDv01Ref & ")," & targetHedgeDv01Ref & "<>0),ABS(" & _
+        hedgeDv01GapRef & ")/ABS(" & targetHedgeDv01Ref & ")," & _
+        XlBlank() & ")"
+End Function
+
+' Actual hedge PnL minus expected/model hedge PnL.
+Public Function HedgeBasisPnLFml(ByVal actualFuturesPnlRef As String, _
+                                  ByVal actualSwapPnlRef As String, _
+                                  ByVal expectedFuturesPnlRef As String, _
+                                  ByVal expectedSwapPnlRef As String) As String
+    HedgeBasisPnLFml = _
+        "=IF(COUNT(" & actualFuturesPnlRef & "," & actualSwapPnlRef & "," & _
+        expectedFuturesPnlRef & "," & expectedSwapPnlRef & ")=0," & _
+        XlBlank() & ",SUM(" & actualFuturesPnlRef & "," & actualSwapPnlRef & _
+        ")-SUM(" & expectedFuturesPnlRef & "," & expectedSwapPnlRef & "))"
+End Function
+
+' Total explained PnL from the model components.
+Public Function TotalExplainedPnLFml(ByVal durationPnlRef As String, _
+                                      ByVal convexityPnlRef As String, _
+                                      ByVal carryPnlRef As String, _
+                                      ByVal fxPnlRef As String, _
+                                      ByVal hedgePnlRef As String, _
+                                      ByVal basisPnlRef As String) As String
+    TotalExplainedPnLFml = _
+        "=IF(COUNT(" & durationPnlRef & "," & convexityPnlRef & "," & _
+        carryPnlRef & "," & fxPnlRef & "," & hedgePnlRef & "," & _
+        basisPnlRef & ")=0," & XlBlank() & ",SUM(" & durationPnlRef & _
+        "," & convexityPnlRef & "," & carryPnlRef & "," & fxPnlRef & _
+        "," & hedgePnlRef & "," & basisPnlRef & "))"
+End Function
+
+' Official PnL minus explained PnL.
+Public Function ResidualPnLFml(ByVal officialPnlRef As String, _
+                                ByVal explainedPnlRef As String) As String
+    ResidualPnLFml = DiffFormula(officialPnlRef, explainedPnlRef)
+End Function
+
+' Residual as a percentage of absolute official PnL.
+Public Function ResidualPercentFml(ByVal residualRef As String, _
+                                    ByVal officialPnlRef As String) As String
+    ResidualPercentFml = _
+        "=IF(AND(ISNUMBER(" & residualRef & "),ISNUMBER(" & officialPnlRef & _
+        ")," & officialPnlRef & "<>0)," & residualRef & "/ABS(" & _
+        officialPnlRef & ")," & XlBlank() & ")"
+End Function
+
+

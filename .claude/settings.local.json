@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -)",
+      "Bash(grep -n \"^Private Function OpenOPICS\\\\|^' OPICS$\\\\|^Private Function colNum\" Pnl_Explain)",
+      "Bash(awk 'NR>=1880 && NR<=1890' Pnl_Explain)",
+      "Bash(python3 -c ' *)",
+      "Bash(cp config/pipeline.yaml /tmp/pipeline.yaml.bak)",
+      "Bash(python3 tools/check_pipeline_config.py)",
+      "Bash(echo \"rc=$? \\(expect 1\\)\")",
+      "Bash(cp /tmp/pipeline.yaml.bak config/pipeline.yaml)",
+      "Bash(echo \"rc=$?\")",
+      "Bash(cat)"
+    ]
+  }
+}
